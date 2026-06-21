@@ -1,178 +1,207 @@
-import { useState, useEffect } from "react";
-import { fetchRecommend, fetchBooks, fetchTags, Book, TagsResponse } from "../api/client";
-import BookCard from "../components/BookCard";
+import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import {
+  fetchNewReleases,
+  fetchRecommendations,
+  fetchRecommended,
+  fetchTrending,
+  type Series,
+} from "../api/client";
+import SeriesCard from "../components/SeriesCard";
+import { useAuth } from "../contexts/AuthContext";
 
 export default function HomePage() {
-  const [preference, setPreference] = useState("");
-  const [recommendedBooks, setRecommendedBooks] = useState<(Book & { matched_tag: string })[]>([]);
-  const [matchedTags, setMatchedTags] = useState<string[]>([]);
-  const [allBooks, setAllBooks] = useState<Book[]>([]);
-  const [tags, setTags] = useState<TagsResponse>({ atmosphere_tags: [], genre_tags: [] });
-  const [selectedAtmosphere, setSelectedAtmosphere] = useState("");
-  const [selectedGenre, setSelectedGenre] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [searched, setSearched] = useState(false);
+  const { user } = useAuth();
+  const [recommended, setRecommended] = useState<Series[]>([]);
+  const [newReleases, setNewReleases] = useState<Series[]>([]);
+  const [trending, setTrending] = useState<Series[]>([]);
+  const [forYou, setForYou] = useState<Series[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // 初回: 新刊一覧とタグを取得
-    fetchBooks({ limit: 12 }).then((res) => setAllBooks(res.data.books));
-    fetchTags().then((res) => setTags(res.data));
+    Promise.all([
+      fetchRecommended(12),
+      fetchNewReleases(12),
+      fetchTrending(12),
+    ])
+      .then(([rec, news, trend]) => {
+        setRecommended(rec.data.series);
+        setNewReleases(news.data.series);
+        setTrending(trend.data.series);
+      })
+      .catch((e) => setError(String(e?.message ?? e)))
+      .finally(() => setLoading(false));
   }, []);
 
-  const handleRecommend = async () => {
-    if (!preference.trim()) return;
-    setLoading(true);
-    setSearched(true);
-    try {
-      const res = await fetchRecommend(preference);
-      setRecommendedBooks(res.data.books);
-      setMatchedTags(res.data.matched_tags);
-    } finally {
-      setLoading(false);
+  // ログインユーザーには、お気に入り/読了からのベクトルおすすめを取得
+  useEffect(() => {
+    if (!user) {
+      setForYou([]);
+      return;
     }
-  };
-
-  const handleTagFilter = async (atmosphere?: string, genre?: string) => {
-    const res = await fetchBooks({ atmosphere, genre, limit: 20 });
-    setAllBooks(res.data.books);
-    setSearched(false);
-    setRecommendedBooks([]);
-  };
+    fetchRecommendations(12)
+      .then((r) => setForYou(r.data.series))
+      .catch(() => setForYou([]));
+  }, [user]);
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-indigo-50 to-white">
-      {/* ヘッダー */}
-      <header className="bg-indigo-700 text-white py-8 px-4 text-center">
-        <h1 className="text-3xl font-bold">📚 Ranobe Finder</h1>
-        <p className="mt-2 text-indigo-200 text-sm">
-          講談社ラノベ文庫の新刊を、あなたの気分で探そう
+    <div>
+      <Hero />
+
+      <div className="max-w-6xl mx-auto px-4 md:px-8 space-y-16 pb-12 -mt-6">
+        {error && <ErrorBanner message={error} />}
+
+        {user && forYou.length > 0 && (
+          <Section
+            emoji="🪄"
+            title="あなたへのおすすめ"
+            subtitle="お気に入り・読了から AI が好みを学習して提案"
+            loading={false}
+            series={forYou}
+            badge={{ label: "For You", color: "mint" }}
+          />
+        )}
+
+        <Section
+          emoji="✨"
+          title="おすすめの定番"
+          subtitle="まずはここから。みんな大好きの王道シリーズ"
+          loading={loading}
+          series={recommended}
+          badge={{ label: "定番", color: "yellow" }}
+        />
+
+        <Section
+          emoji="🆕"
+          title="新作・新刊"
+          subtitle="この春の新しい1冊"
+          loading={loading}
+          series={newReleases}
+          badge={{ label: "NEW", color: "pink" }}
+        />
+
+        <Section
+          emoji="🔥"
+          title="話題沸騰中"
+          subtitle="いまSNSで盛り上がっているシリーズ"
+          loading={loading}
+          series={trending}
+          badge={{ label: "HOT", color: "blue" }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Hero() {
+  return (
+    <section className="relative overflow-hidden">
+      <div className="absolute inset-0 bg-pop-gradient opacity-90" />
+      {/* 装飾用ふわふわ円 */}
+      <div className="absolute -left-12 -top-12 w-64 h-64 rounded-full bg-white/20 blur-2xl" />
+      <div className="absolute right-0 bottom-0 w-72 h-72 rounded-full bg-accent-400/40 blur-3xl" />
+
+      <div className="relative max-w-6xl mx-auto px-4 md:px-8 py-16 md:py-24 text-white">
+        <h1 className="font-rounded font-extrabold text-3xl md:text-5xl leading-tight">
+          きょうの気分に
+          <br />
+          ぴったりの1冊を。
+        </h1>
+        <p className="mt-4 md:mt-6 text-base md:text-lg font-rounded font-medium max-w-xl opacity-95">
+          AI がライトノベルを「コメディ」「切ない」「胸キュン」など7つの軸でスコアリング。
+          気分から本を選べます。
         </p>
-      </header>
+        <div className="mt-8 flex flex-wrap gap-3">
+          <Link to="/search" className="btn-pop bg-white !text-primary-600 hover:bg-cream-50">
+            🔍 さがしてみる
+          </Link>
+          <Link
+            to="/auth"
+            className="btn-ghost !border-white !text-white hover:!bg-white/15"
+          >
+            ✨ アカウントを作る
+          </Link>
+        </div>
+      </div>
+    </section>
+  );
+}
 
-      <main className="max-w-4xl mx-auto px-4 py-8">
-        {/* 雰囲気検索 */}
-        <section className="bg-white rounded-2xl shadow p-6 mb-8">
-          <h2 className="text-lg font-bold text-gray-800 mb-3">
-            🔍 読みたい雰囲気で探す
+function Section({
+  emoji,
+  title,
+  subtitle,
+  series,
+  loading,
+  badge,
+}: {
+  emoji: string;
+  title: string;
+  subtitle?: string;
+  series: Series[];
+  loading: boolean;
+  badge?: { label: string; color?: "pink" | "blue" | "yellow" | "mint" };
+}) {
+  return (
+    <section>
+      <div className="flex items-end justify-between gap-2 mb-5">
+        <div>
+          <h2 className="section-title">
+            <span className="text-3xl">{emoji}</span>
+            {title}
           </h2>
-          <p className="text-gray-500 text-sm mb-4">
-            例：「切ない恋愛で泣けるやつ」「異世界でバトルがあって笑える」
-          </p>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={preference}
-              onChange={(e) => setPreference(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleRecommend()}
-              placeholder="どんな雰囲気のラノベが読みたいですか？"
-              className="flex-1 border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
-            />
-            <button
-              onClick={handleRecommend}
-              disabled={loading}
-              className="bg-indigo-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50"
-            >
-              {loading ? "検索中..." : "おすすめ！"}
-            </button>
-          </div>
-
-          {/* マッチしたタグ表示 */}
-          {matchedTags.length > 0 && (
-            <div className="mt-3 flex flex-wrap gap-1">
-              <span className="text-xs text-gray-500">検索タグ：</span>
-              {matchedTags.map((tag) => (
-                <span
-                  key={tag}
-                  className="bg-indigo-100 text-indigo-700 text-xs px-2 py-0.5 rounded-full"
-                >
-                  {tag}
-                </span>
-              ))}
-            </div>
+          {subtitle && (
+            <p className="text-ink-muted font-rounded mt-1 text-sm md:text-base">
+              {subtitle}
+            </p>
           )}
-        </section>
+        </div>
+      </div>
 
-        {/* 推薦結果 */}
-        {searched && (
-          <section className="mb-10">
-            <h2 className="text-lg font-bold text-gray-800 mb-4">
-              ✨ あなたへのおすすめ
-            </h2>
-            {recommendedBooks.length === 0 ? (
-              <p className="text-gray-400 text-center py-8">
-                一致する作品が見つかりませんでした。別の言葉で試してみてください。
-              </p>
-            ) : (
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
-                {recommendedBooks.map((book) => (
-                  <BookCard key={book.id} book={book} matchedTag={book.matched_tag} />
-                ))}
-              </div>
-            )}
-          </section>
-        )}
+      {loading ? (
+        <SkeletonGrid />
+      ) : series.length === 0 ? (
+        <EmptyHint />
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4 md:gap-5">
+          {series.map((s) => (
+            <SeriesCard key={s.id} series={s} badge={badge} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
 
-        {/* タグフィルター */}
-        <section className="mb-6">
-          <h2 className="text-lg font-bold text-gray-800 mb-3">🏷️ タグで絞り込む</h2>
-          <div className="mb-2">
-            <p className="text-xs text-gray-500 mb-1">雰囲気</p>
-            <div className="flex flex-wrap gap-2">
-              {tags.atmosphere_tags.map((tag) => (
-                <button
-                  key={tag}
-                  onClick={() => {
-                    const next = selectedAtmosphere === tag ? "" : tag;
-                    setSelectedAtmosphere(next);
-                    handleTagFilter(next || undefined, selectedGenre || undefined);
-                  }}
-                  className={`text-xs px-3 py-1 rounded-full border transition-colors ${
-                    selectedAtmosphere === tag
-                      ? "bg-pink-500 text-white border-pink-500"
-                      : "border-pink-300 text-pink-600 hover:bg-pink-50"
-                  }`}
-                >
-                  {tag}
-                </button>
-              ))}
-            </div>
+function SkeletonGrid() {
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4 md:gap-5">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div key={i} className="card animate-pulse">
+          <div className="aspect-[3/4] bg-cream-100" />
+          <div className="p-4 space-y-2">
+            <div className="h-3 bg-cream-100 rounded w-3/4" />
+            <div className="h-2 bg-cream-100 rounded w-1/2" />
           </div>
-          <div>
-            <p className="text-xs text-gray-500 mb-1">ジャンル</p>
-            <div className="flex flex-wrap gap-2">
-              {tags.genre_tags.map((tag) => (
-                <button
-                  key={tag}
-                  onClick={() => {
-                    const next = selectedGenre === tag ? "" : tag;
-                    setSelectedGenre(next);
-                    handleTagFilter(selectedAtmosphere || undefined, next || undefined);
-                  }}
-                  className={`text-xs px-3 py-1 rounded-full border transition-colors ${
-                    selectedGenre === tag
-                      ? "bg-indigo-500 text-white border-indigo-500"
-                      : "border-indigo-300 text-indigo-600 hover:bg-indigo-50"
-                  }`}
-                >
-                  {tag}
-                </button>
-              ))}
-            </div>
-          </div>
-        </section>
+        </div>
+      ))}
+    </div>
+  );
+}
 
-        {/* 新刊一覧 */}
-        {!searched && (
-          <section>
-            <h2 className="text-lg font-bold text-gray-800 mb-4">🆕 最近の新刊</h2>
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
-              {allBooks.map((book) => (
-                <BookCard key={book.id} book={book} />
-              ))}
-            </div>
-          </section>
-        )}
-      </main>
+function EmptyHint() {
+  return (
+    <div className="card p-8 text-center text-ink-muted font-rounded">
+      まだデータがありません。バックエンドのデータパイプラインを実行してください。
+    </div>
+  );
+}
+
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div className="card p-4 bg-primary-50 text-primary-700 font-rounded">
+      ⚠️ データ取得に失敗: {message}
     </div>
   );
 }

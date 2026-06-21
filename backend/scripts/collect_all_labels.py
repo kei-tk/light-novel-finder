@@ -52,6 +52,8 @@ LIGHT_NOVEL_LABELS: list[dict] = [
     {"name": "角川ビーンズ文庫",      "prefixes": ["978404"]},
     {"name": "ファミ通文庫",         "prefixes": ["978404"]},
     {"name": "電撃の新文芸",         "prefixes": ["978404"]},
+    {"name": "カドカワBOOKS",        "prefixes": ["978404"]},
+    {"name": "MFブックス",           "prefixes": ["978404"]},
     # 集英社 (978-4-08)
     {"name": "ダッシュエックス文庫",  "prefixes": ["978408"]},
     {"name": "コバルト文庫",         "prefixes": ["978408"]},

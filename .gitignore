@@ -60,3 +60,17 @@ CLAUDE.local.md
 *.tmp
 tmp/
 scratch/
+
+# ========== データ・キャッシュ (再生成可能 / 大容量、コミットしない) ==========
+# ベクトル .npz (302MB) / 要約・観点 JSONL。正本は DB
+backend/cache/
+# タグ等のバックアップ JSON
+backend/backups/
+# バッチ実行の一時状態
+backend/batch_state.json
+# 実行ログ
+log.txt
+log2.txt
+skip_log.txt
+backend/skip_log.txt
+*.log

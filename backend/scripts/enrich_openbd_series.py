@@ -32,10 +32,53 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.services.gemini import (
     enrich_openbd_series as gemini_enrich,
     enrich_series_popularity as gemini_enrich_popularity,
+    enrich_series_multipass as gemini_enrich_multipass,
+    reset_usage as gemini_reset_usage,
+    get_usage as gemini_get_usage,
 )
 from app.services.supabase_client import get_supabase
 
 GEMINI_INTERVAL_SEC = 1   # 直列実行時の間隔 (並列化時は無関係)
+
+# モデル別 料金 (USD / 1M tokens)。2026-06 時点の公開値ベース、変動の可能性あり。
+# 未知モデルは _PRICING_DEFAULT で概算。実料金は Google AI Studio で要確認。
+MODEL_PRICING = {
+    # 3.5-flash は output に thinking token も含めて課金される。2026-06 時点の公式値。
+    "gemini-3.5-flash":        {"input": 1.50, "output": 9.00},
+    "gemini-2.5-flash":        {"input": 0.30, "output": 2.50},
+    "gemini-3.1-flash-lite":   {"input": 0.10, "output": 0.40},
+    "gemini-2.5-flash-lite":   {"input": 0.10, "output": 0.40},
+    "gemini-3.1-pro-preview":  {"input": 1.25, "output": 5.00},
+    "gemini-2.5-pro":          {"input": 1.25, "output": 5.00},
+}
+_PRICING_DEFAULT = {"input": 0.30, "output": 2.50}
+
+
+def print_usage_cost(target_count: int) -> None:
+    """gemini.get_usage() の実測トークンからモデル別コストを表示し、全件外挿する。"""
+    usage = gemini_get_usage()
+    if not usage["calls"]:
+        return
+    print("\n========== 実測 API 使用量 / コスト ==========")
+    grand_total = 0.0
+    series_done = max(target_count, 1)
+    for model, u in sorted(usage["by_model"].items()):
+        price = MODEL_PRICING.get(model, _PRICING_DEFAULT)
+        # thinking tokens は output と同単価で課金される想定
+        out_tokens = u["output"] + u["thinking"]
+        in_cost = u["input"] / 1_000_000 * price["input"]
+        out_cost = out_tokens / 1_000_000 * price["output"]
+        sub = in_cost + out_cost
+        grand_total += sub
+        note = "" if model in MODEL_PRICING else "  (※単価デフォルト)"
+        print(f"  [{model}]{note}")
+        print(f"    call={u['calls']}  input={u['input']:,}  "
+              f"output={u['output']:,}  thinking={u['thinking']:,}")
+        print(f"    コスト: ${sub:.4f}  (in ${in_cost:.4f} / out ${out_cost:.4f})")
+    print(f"  ─────")
+    print(f"  実測合計: ${grand_total:.4f}  (処理 {series_done} シリーズ, "
+          f"1件あたり ${grand_total/series_done:.4f})")
+    print("==============================================")
 MAX_BOOKS_PER_SERIES = 6  # プロンプトに含める書籍数
 DEFAULT_WORKERS = 5       # 並列ワーカー数
 
@@ -107,12 +150,15 @@ def _paginate_select(query_factory, page_size: int = 1000) -> list[dict]:
 
 def fetch_target_series(supabase, redo_all: bool, imprint: str | None,
                        series_id: str | None, series_only: bool,
-                       limit: int | None) -> list[dict]:
-    """エンリッチ対象の series を抽出"""
+                       limit: int | None,
+                       skip_updated_since: str | None = None) -> list[dict]:
+    """エンリッチ対象の series を抽出。
+    skip_updated_since (ISO 8601) が指定されたら、その日時以降に更新された series は除外する
+    (再開時に「前回 run で処理済みのもの」をスキップする用)。"""
     def factory():
         q = supabase.table("openbd_test_series").select(
             "id, series_title, author, imprint, volume_count, is_series, "
-            "popularity_score, is_special_edition"
+            "popularity_score, is_special_edition, updated_at"
         )
         if imprint:
             q = q.eq("imprint", imprint)
@@ -126,6 +172,9 @@ def fetch_target_series(supabase, redo_all: bool, imprint: str | None,
             # popularity_score または momentum_score のいずれかが NULL を未エンリッチとみなす
             # (momentum_score は新規軸なので、過去 enrich 済みでも momentum_score=NULL のものは再評価対象)
             q = q.or_("popularity_score.is.null,momentum_score.is.null")
+        if skip_updated_since:
+            # この時刻より前に更新された (= 今回 run で触っていない) ものだけ対象
+            q = q.lt("updated_at", skip_updated_since)
         return q
     rows = _paginate_select(factory)
     if limit:
@@ -168,9 +217,12 @@ def fetch_anchor_examples(supabase, max_per_band: int = 2) -> list[dict]:
 def fetch_tag_dicts(supabase) -> tuple[dict[str, list[dict]], dict[str, list[dict]], dict[tuple[str, str], dict]]:
     """tags マスタを (公式辞書, AI生成タグ) に分けて取得。
     第3戻り値は (tag_type, name) → row dict のインデックス (usage_count 更新で使う)。
+    公式タグには importance (1-3, NULL は 1 扱い) も含めてプロンプトに渡せるようにする。
+    sub_genre タグは subcategory フィールドも item に格納する (multipass 用)。
     """
     rows = supabase.table("tags").select(
-        "id, name, description, tag_type, is_ai_generated, usage_count"
+        "id, name, description, tag_type, is_ai_generated, usage_count, "
+        "importance, subcategory"
     ).execute().data or []
     master: dict[str, list[dict]] = {"atmosphere": [], "genre": [], "sub_genre": []}
     ai:     dict[str, list[dict]] = {"atmosphere": [], "genre": [], "sub_genre": []}
@@ -179,13 +231,38 @@ def fetch_tag_dicts(supabase) -> tuple[dict[str, list[dict]], dict[str, list[dic
         t = r.get("tag_type")
         if t not in master:
             continue
-        item = {"name": r.get("name"), "description": r.get("description") or ""}
+        item = {
+            "name": r.get("name"),
+            "description": r.get("description") or "",
+            "importance": r.get("importance") or 1,
+            "subcategory": r.get("subcategory"),  # sub_genre のみ非 None 想定
+        }
         if r.get("is_ai_generated"):
             ai[t].append(item)
         else:
             master[t].append(item)
         index[(t, r["name"])] = r
     return master, ai, index
+
+
+def group_sub_genre_by_subcategory(
+    master: dict[str, list[dict]],
+    ai: dict[str, list[dict]],
+) -> dict[str, list[dict]]:
+    """sub_genre タグを subcategory 別に束ねる (multipass の入力用)。
+    NULL や未定義 subcategory のタグは集約せず捨てる (multipass の候補リストに乗らない)。
+    sub_genre タグは 6 種のいずれかに必ず分類されている前提。
+    """
+    from app.services.gemini import SUB_GENRE_SUBCATEGORY_ORDER
+    valid = set(SUB_GENRE_SUBCATEGORY_ORDER)
+    buckets: dict[str, list[dict]] = {k: [] for k in SUB_GENRE_SUBCATEGORY_ORDER}
+    for src in (master.get("sub_genre") or []) + (ai.get("sub_genre") or []):
+        sub = src.get("subcategory")
+        if sub not in valid:
+            # NULL や予期せぬ値は無視 (該当タグは候補リストに含まれず、付与されない)
+            continue
+        buckets[sub].append(src)
+    return buckets
 
 
 _TAG_TYPE_MAP = {
@@ -196,8 +273,13 @@ _TAG_TYPE_MAP = {
 
 
 def register_ai_tags(supabase, enriched: dict, tag_index: dict[tuple[str, str], dict]):
-    """Gemini 応答内のタグを tags マスタと照合し、新規なら AI 生成タグとして登録、
-    既存 AI タグなら usage_count を +1 する。マスタ既存タグは触らない。
+    """Gemini 応答内のタグを tags マスタと照合し、
+      - 新規 → AI 生成タグとして INSERT
+      - 既存 (AI 生成 / マスタ問わず) → usage_count を +1
+    する。
+
+    マスタタグの usage_count もカウントすることで、検索 UI 等で
+    「よく使われているタグ」を正しく集計できるようにする。
 
     enriched: Gemini レスポンス
     tag_index: (tag_type, name) → existing row dict (リクエスト時のスナップショット)
@@ -233,8 +315,8 @@ def register_ai_tags(supabase, enriched: dict, tag_index: dict[tuple[str, str], 
                     # ユニーク違反 (並行時) は無視
                     if "duplicate" not in str(e).lower() and "23505" not in str(e):
                         print(f"  ! AI タグ追加失敗 {name!r}: {e}")
-            elif existing.get("is_ai_generated"):
-                # 既存 AI タグ → usage_count 増加
+            else:
+                # 既存タグ (AI 生成 / マスタどちらも) → usage_count 増加
                 try:
                     new_count_val = (existing.get("usage_count") or 0) + 1
                     _retry_supabase(
@@ -246,7 +328,6 @@ def register_ai_tags(supabase, enriched: dict, tag_index: dict[tuple[str, str], 
                     incremented += 1
                 except Exception as e:
                     print(f"  ! usage_count 更新失敗 {name!r}: {e}")
-            # マスタタグはノータッチ
     return new_count, incremented
 
 
@@ -261,9 +342,16 @@ def _coerce_score(v):
     return max(0, min(100, n))
 
 
-def _build_update(enriched: dict) -> dict:
+_TAG_FIELDS = ["atmosphere_tags", "genre_tags", "sub_genre_tags"]
+
+
+def _build_update(enriched: dict, tags_only: bool = False) -> dict:
+    """Gemini レスポンスから DB 更新用辞書を組み立てる。
+    tags_only=True ならスコア類は除外し、タグ配列のみ更新する。
+    """
     update: dict = {}
-    for key in _UPDATE_FIELDS:
+    fields = _TAG_FIELDS if tags_only else _UPDATE_FIELDS
+    for key in fields:
         v = enriched.get(key)
         if v is None:
             continue
@@ -282,9 +370,29 @@ def main(redo_all: bool, limit: int | None, dry_run: bool,
          two_phase: bool = False,
          popularity_model: str | None = None,
          popularity_grounding: bool = True,
-         workers: int = DEFAULT_WORKERS):
+         workers: int = DEFAULT_WORKERS,
+         multipass: bool = False,
+         mp_atmo_genre_model: str | None = None,
+         mp_sub_genre_model: str | None = None,
+         mp_atmo_genre_grounding: bool = True,
+         mp_sub_genre_grounding: bool = True,
+         tags_only: bool = False,
+         skip_updated_since: str | None = None):
     supabase = get_supabase()
-    print(f"[Gemini 設定 Phase1] model={model or '(Flash)'}  grounding={use_grounding}")
+    gemini_reset_usage()  # コスト計測用に使用量カウンタをリセット
+    if tags_only:
+        print("[モード] tags-only — タグ配列のみ更新 (スコアは温存)")
+    if skip_updated_since:
+        print(f"[再開] updated_at >= {skip_updated_since} の series はスキップ")
+    if multipass:
+        print(f"[Gemini 設定 multipass]")
+        print(f"  atmo+genre: model={mp_atmo_genre_model or model or '(default)'}  "
+              f"grounding={mp_atmo_genre_grounding}")
+        print(f"  sub_genre : model={mp_sub_genre_model or model or '(default)'}  "
+              f"grounding={mp_sub_genre_grounding}")
+        print(f"  (atmo+genre 3 call + sub_genre Phase1/2 × 6 subcat = ~15 call/シリーズ)")
+    else:
+        print(f"[Gemini 設定 Phase1] model={model or '(Flash)'}  grounding={use_grounding}")
     if two_phase:
         print(f"[Gemini 設定 Phase2] model={popularity_model or '(Pro)'}  "
               f"grounding={popularity_grounding}  (popularity/momentum のみ)")
@@ -300,6 +408,14 @@ def main(redo_all: bool, limit: int | None, dry_run: bool,
     print(f"  → AI生成 {total_ai}件 "
           f"(atmosphere {len(ai_tags['atmosphere'])} / "
           f"genre {len(ai_tags['genre'])} / sub_genre {len(ai_tags['sub_genre'])})")
+    # multipass 用に sub_genre を subcategory 別に束ねる
+    sub_genre_buckets: dict[str, list[dict]] = {}
+    if multipass:
+        sub_genre_buckets = group_sub_genre_by_subcategory(master_tags, ai_tags)
+        bucket_counts = ", ".join(
+            f"{k}={len(v)}" for k, v in sub_genre_buckets.items() if v
+        )
+        print(f"  → multipass sub_genre subcategory 分布: {bucket_counts}")
 
     # anchor (既評価シリーズの参考) を取得
     print("\n[anchor 取得 (既評価シリーズの calibration 用)]")
@@ -312,9 +428,11 @@ def main(redo_all: bool, limit: int | None, dry_run: bool,
 
     print("\n[対象シリーズ 抽出]")
     targets = fetch_target_series(supabase, redo_all, imprint, series_id,
-                                   series_only, limit)
+                                   series_only, limit,
+                                   skip_updated_since=skip_updated_since)
     print(f"  → {len(targets):,}シリーズ "
-          f"({'全件上書き再評価' if redo_all else '未エンリッチのみ'})")
+          f"({'全件上書き再評価' if redo_all else '未エンリッチのみ'}"
+          f"{', skip-updated-since 適用' if skip_updated_since else ''})")
     if not targets:
         return
 
@@ -345,20 +463,44 @@ def main(redo_all: bool, limit: int | None, dry_run: bool,
             info["error"] = "紐付け書籍が0件"
             return info
 
-        # Phase 1
+        # Phase 1 (single-call または multipass を切替)
         try:
-            enriched = gemini_enrich(
-                series_title=title,
-                author=author,
-                imprint=imp,
-                volume_count=vc,
-                books=books[:MAX_BOOKS_PER_SERIES],
-                tag_dict=master_tags,
-                ai_tag_dict=ai_tags,
-                model=model,
-                use_grounding=use_grounding,
-                score_anchors=score_anchors,
-            )
+            if multipass:
+                # atmosphere / genre は公式 + AI を統合して候補に使う
+                atmo_cands = (master_tags.get("atmosphere") or []) + \
+                             (ai_tags.get("atmosphere") or [])
+                genre_cands = (master_tags.get("genre") or []) + \
+                              (ai_tags.get("genre") or [])
+                enriched = gemini_enrich_multipass(
+                    series_title=title,
+                    author=author,
+                    imprint=imp,
+                    volume_count=vc,
+                    books=books[:MAX_BOOKS_PER_SERIES],
+                    atmosphere_candidates=atmo_cands,
+                    genre_candidates=genre_cands,
+                    sub_genre_by_subcategory=sub_genre_buckets,
+                    model=model,
+                    use_grounding=use_grounding,
+                    atmo_genre_model=mp_atmo_genre_model,
+                    atmo_genre_grounding=mp_atmo_genre_grounding,
+                    sub_genre_model=mp_sub_genre_model,
+                    sub_genre_grounding=mp_sub_genre_grounding,
+                    score_anchors=score_anchors,
+                )
+            else:
+                enriched = gemini_enrich(
+                    series_title=title,
+                    author=author,
+                    imprint=imp,
+                    volume_count=vc,
+                    books=books[:MAX_BOOKS_PER_SERIES],
+                    tag_dict=master_tags,
+                    ai_tag_dict=ai_tags,
+                    model=model,
+                    use_grounding=use_grounding,
+                    score_anchors=score_anchors,
+                )
         except Exception as e:
             info["error"] = f"Phase1 Gemini 呼び出し失敗: {e}"
             return info
@@ -391,7 +533,7 @@ def main(redo_all: bool, limit: int | None, dry_run: bool,
                     enriched["momentum_score"] = ms
                 info["phase2_rationale"] = pop_result.get("rationale")
 
-        update = _build_update(enriched)
+        update = _build_update(enriched, tags_only=tags_only)
         if not update:
             info["error"] = "更新フィールドなし"
             return info
@@ -467,14 +609,16 @@ def main(redo_all: bool, limit: int | None, dry_run: bool,
                 if info.get("phase2_error"):
                     print(f"  ! Phase2 失敗: {info['phase2_error']}")
                 if info.get("new_ai_tags") or info.get("inc_ai_tags"):
-                    print(f"  AI タグ: 新規 {info['new_ai_tags']} / "
-                          f"既出 +1 {info['inc_ai_tags']}")
+                    print(f"  タグ集計: 新規AIタグ {info['new_ai_tags']} / "
+                          f"usage_count +1 {info['inc_ai_tags']} (公式+AI)")
                 if info.get("error") and info.get("enriched"):
                     # 保存失敗等 (Gemini 自体は成功)
                     print(f"  ! {info['error']}")
 
     print(f"\n[完了] 成功 {counters['success']} / 失敗 {counters['failed']}"
           f"{'  (DRY RUN: 保存スキップ)' if dry_run else ''}")
+
+    print_usage_cost(len(targets))
 
 
 if __name__ == "__main__":
@@ -501,6 +645,30 @@ if __name__ == "__main__":
                         help="Phase2 の Web grounding を無効化")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"並列ワーカー数 (デフォルト {DEFAULT_WORKERS})")
+    parser.add_argument("--multipass", action="store_true",
+                        help="サブカテゴリ毎に Phase1 (候補広め) + Phase2 (検証) "
+                             "で精度を上げる。1 シリーズあたり Gemini call が ~16 倍に増える")
+    # multipass 限定: atmo+genre と sub_genre で別モデル / 別 grounding
+    parser.add_argument("--mp-atmo-genre-model", default="gemini-3.1-flash-lite",
+                        help="multipass: atmo+genre 用モデル "
+                             "(デフォルト gemini-3.1-flash-lite)")
+    parser.add_argument("--mp-sub-genre-model", default="gemini-3.1-flash-lite",
+                        help="multipass: sub_genre 用モデル "
+                             "(デフォルト gemini-3.1-flash-lite)")
+    parser.add_argument("--mp-no-atmo-genre-grounding", action="store_true",
+                        help="multipass: atmo+genre の grounding を OFF にする "
+                             "(デフォルト ON)")
+    parser.add_argument("--mp-no-sub-genre-grounding", action="store_true",
+                        help="multipass: sub_genre の grounding を OFF にする "
+                             "(デフォルト ON)")
+    parser.add_argument("--tags-only", action="store_true",
+                        help="タグ配列のみ更新する。スコア (comedy/serious 等 / "
+                             "popularity / momentum) は DB の既存値を温存")
+    parser.add_argument("--skip-updated-since", default=None,
+                        metavar="ISO_TIMESTAMP",
+                        help="再開用: この日時 (ISO 8601, 例 '2026-06-08T03:00:00+00:00') "
+                             "以降に updated_at が更新された series をスキップ。"
+                             "中断した run の開始時刻を指定すれば、処理済みを飛ばして続行できる。")
     args = parser.parse_args()
 
     def _resolve_model(name: str | None) -> str | None:
@@ -514,6 +682,8 @@ if __name__ == "__main__":
 
     model_name = _resolve_model(args.model)
     popularity_model_name = _resolve_model(args.popularity_model)
+    mp_atmo_model = _resolve_model(args.mp_atmo_genre_model)
+    mp_sub_model = _resolve_model(args.mp_sub_genre_model)
     main(redo_all=args.all, limit=args.limit, dry_run=args.dry_run,
          imprint=args.imprint, series_id=args.series_id,
          series_only=args.series_only, sleep_sec=args.sleep,
@@ -521,4 +691,11 @@ if __name__ == "__main__":
          two_phase=args.two_phase,
          popularity_model=popularity_model_name,
          popularity_grounding=not args.no_popularity_grounding,
-         workers=args.workers)
+         workers=args.workers,
+         multipass=args.multipass,
+         mp_atmo_genre_model=mp_atmo_model,
+         mp_sub_genre_model=mp_sub_model,
+         mp_atmo_genre_grounding=not args.mp_no_atmo_genre_grounding,
+         mp_sub_genre_grounding=not args.mp_no_sub_genre_grounding,
+         tags_only=args.tags_only,
+         skip_updated_since=args.skip_updated_since)

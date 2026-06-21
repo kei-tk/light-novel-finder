@@ -1,10 +1,53 @@
 import json
 import re
 import time
+import threading
 import httpx
 from google import genai
 from google.genai import types
 from app.config import settings
+
+
+# =====================================================================
+# Gemini API 使用量アキュムレータ (コスト計測用)
+#   全 _single_generate 呼び出しの usage_metadata をモデル別に集計する。
+#   reset_usage() でリセット、get_usage() でスナップショット取得。
+#   スレッドセーフ (ThreadPoolExecutor 並列下でも正しく加算)。
+# =====================================================================
+_USAGE_LOCK = threading.Lock()
+_USAGE_ACCUM: dict = {"calls": 0, "by_model": {}}
+
+
+def reset_usage() -> None:
+    with _USAGE_LOCK:
+        _USAGE_ACCUM["calls"] = 0
+        _USAGE_ACCUM["by_model"] = {}
+
+
+def get_usage() -> dict:
+    """使用量スナップショット {calls, by_model:{model:{calls,input,output,thinking}}} を返す。"""
+    with _USAGE_LOCK:
+        return {
+            "calls": _USAGE_ACCUM["calls"],
+            "by_model": {m: dict(v) for m, v in _USAGE_ACCUM["by_model"].items()},
+        }
+
+
+def _record_usage(model: str, response) -> None:
+    um = getattr(response, "usage_metadata", None)
+    if um is None:
+        return
+    inp = getattr(um, "prompt_token_count", 0) or 0
+    out = getattr(um, "candidates_token_count", 0) or 0
+    think = getattr(um, "thoughts_token_count", 0) or 0
+    with _USAGE_LOCK:
+        _USAGE_ACCUM["calls"] += 1
+        d = _USAGE_ACCUM["by_model"].setdefault(
+            model, {"calls": 0, "input": 0, "output": 0, "thinking": 0})
+        d["calls"] += 1
+        d["input"] += inp
+        d["output"] += out
+        d["thinking"] += think
 
 client = genai.Client(api_key=settings.gemini_api_key)
 
@@ -16,6 +59,40 @@ PROHIBITED_FALLBACK_CHAIN = [
     ("gemini-3.1-pro-preview", True),   # 1段目: 3.x の上位モデル
     ("gemini-2.5-pro", False),           # 2段目: 2.5 + grounding OFF (検索由来の prohibited 回避)
 ]
+
+
+# =====================================================================
+# 重要度 (importance) 機能のオンオフ。
+# False の場合:
+#   - プロンプトに [重要度★★★] / [重要度★★] のマーカーを付けない
+#   - 重要度に関連する「厳密に判定せよ」等の追加指示も省く
+#   - tags.importance カラムや set_tag_importance.py スクリプトは温存
+# True に戻せば、importance 列のデータをそのまま使って機能が復活する。
+# =====================================================================
+IMPORTANCE_ENABLED = False
+
+_IMPORTANCE_MAIN_RULES = (
+    "- **[重要度★★★] のタグは特に検索品質に影響するため、該当判定を厳密に行うこと。**\n"
+    "  確信が持てない場合は付与しない。誤付与は厳禁。\n"
+    "- [重要度★★] のタグも通常より一段慎重に判定すること。"
+)
+_IMPORTANCE_PHASE1_RULE = (
+    "- [重要度★★★] のタグは慎重に — 該当の確証がない場合は含めないこと"
+)
+_IMPORTANCE_PHASE2_RULES = (
+    "- [重要度★★★] のタグは特に厳密に。確信が持てない場合は必ず除外\n"
+    "- [重要度★★] のタグも一段慎重に"
+)
+
+
+def _imp_main_rules() -> str:
+    return _IMPORTANCE_MAIN_RULES if IMPORTANCE_ENABLED else ""
+
+def _imp_phase1_rule() -> str:
+    return _IMPORTANCE_PHASE1_RULE if IMPORTANCE_ENABLED else ""
+
+def _imp_phase2_rules() -> str:
+    return _IMPORTANCE_PHASE2_RULES if IMPORTANCE_ENABLED else ""
 
 
 def _single_generate(
@@ -47,6 +124,7 @@ def _single_generate(
                 contents=prompt,
                 config=types.GenerateContentConfig(**config_kwargs),
             )
+            _record_usage(model, response)
             text = (response.text or "").strip()
             if text:
                 return "ok", text
@@ -150,10 +228,12 @@ def _format_tag_dict(tag_dict: dict[str, list[dict]] | None,
     タグ辞書をプロンプト用の優先タグリストに整形する。
     tag_dict 例:
       {
-        "atmosphere": [{"name": "胸キュン", "description": "..."}, ...],
+        "atmosphere": [{"name": "胸キュン", "description": "...", "importance": 3}, ...],
         "genre":      [...],
         "sub_genre":  [...],
       }
+    importance は 1-3 (NULL は 1 扱い)。2 以上なら ★ マーカーを付け、
+    Gemini に「該当判定を厳密に行う」旨を示す。
     """
     if not tag_dict:
         return ""
@@ -170,12 +250,28 @@ def _format_tag_dict(tag_dict: dict[str, list[dict]] | None,
             continue
         has_any = True
         lines.append(f"\n■ {label}：")
-        for it in items:
+        # 重要度が ON のときのみ降順ソート (OFF は元順序を尊重)
+        if IMPORTANCE_ENABLED:
+            items_sorted = sorted(items, key=lambda it: -(it.get("importance") or 1))
+        else:
+            items_sorted = items
+        for it in items_sorted:
             name = (it.get("name") or "").strip()
             if not name:
                 continue
             desc = (it.get("description") or "").strip()
-            lines.append(f"  - {name}: {desc}" if desc else f"  - {name}")
+            if IMPORTANCE_ENABLED:
+                importance = it.get("importance") or 1
+                if importance >= 3:
+                    marker = " [重要度★★★]"
+                elif importance >= 2:
+                    marker = " [重要度★★]"
+                else:
+                    marker = ""
+            else:
+                marker = ""
+            head = f"  - {name}{marker}"
+            lines.append(f"{head}: {desc}" if desc else head)
     return "\n".join(lines) if has_any else ""
 
 
@@ -304,6 +400,7 @@ def enrich_openbd_series(
 - 当てはまる表記をそのまま使うこと（同じ意味でも別表記にしない／表記揺れを作らない）
 - 各タグの説明文と作品内容を照合し、**確実に該当**するもののみ選ぶ
   （ストーリーや設定に明確に存在する要素だけ。推測・連想で付けない）
+{_imp_main_rules()}
 {master_tag_section}
 """ if master_tag_section else ""
         ai_block = f"""
@@ -314,11 +411,15 @@ def enrich_openbd_series(
 {ai_tag_section}
 """ if ai_tag_section else ""
         new_tag_rule = """
-【新規タグ作成ルール】
-- 公式辞書にも既出タグにも該当しない、作品の重要な特徴がある場合のみ新規タグを追加してよい
-- 1作品あたり**新規追加は最大3個まで** (atmosphere/genre/sub_genre 合計)
-- 新規タグは「具体的・短く・他作品でも使い回せる」名前にする (固有名詞や本作専用にしない)
-- 不確かなら作らない (精度優先)
+【新規タグ作成ルール — 原則禁止 / 厳格条件】
+- **新規タグ作成は原則禁止**。まず公式辞書 + 既出 AI タグから当てはまるものを徹底的に探すこと
+- 以下の **全ての条件を満たした場合のみ**、1作品あたり**最大 1 個まで**新規追加してよい:
+  1. 作品を**象徴する核心的な特徴**であり、既存のどのタグでも代替できない
+  2. 同レーベル・同ジャンルの**他作品でも 5 件以上で使い回せる**確信がある (固有名詞・本作専用は不可)
+  3. 既存タグの言い換え・微妙な表記揺れ・既存タグの細分化ではない
+  4. 既存タグの組み合わせでカバーできない独立した概念である
+- 上記いずれかに不確かさがあれば**作らない**。1個でも怪しければ 0 個でよい (精度優先)
+- 新規タグ名は「具体的・短く・他作品でも使い回せる」名前にする
 """
         tag_instruction = master_block + ai_block + new_tag_rule
     else:
@@ -453,11 +554,381 @@ JSONのみ返すこと。
     return {}
 
 
+# =====================================================================
+# Multipass enrich: サブカテゴリ毎に Phase1 (候補広め) + Phase2 (検証) で精度を上げる
+# =====================================================================
+
+SUB_GENRE_SUBCATEGORY_ORDER = [
+    "relationship", "character", "profession", "setting",
+    "plot", "format",
+]
+SUB_GENRE_SUBCATEGORY_LABELS = {
+    "relationship": "関係性 — 主要人物同士の関係 (バディ・三角関係・身分差恋愛・師弟・幼なじみ 等)",
+    "character":    "キャラ — 主要人物の性格や特徴 (吸血鬼・お嬢様・最強主人公・陰キャ・天才 等)",
+    "profession":   "職業 — 主要人物の職業 (騎士・冒険者・教師・医者・剣士・忍者 等)",
+    "setting":      "世界観 — その物語がどのような世界か (異世界・後宮・近未来・ダンジョン・現代ファンタジー 等)",
+    "plot":         "ストーリー — ストーリーの重要な要素 (復讐・成り上がり・記憶喪失・群像劇 等)",
+    "format":       "形式 — 作品の形式 (短編集・ノベライズ・TRPGリプレイ・単巻完結 等)",
+}
+
+# 全 sub_genre タグに共通する適用ルール。Phase1/Phase2 のプロンプトに注入する。
+SUB_GENRE_GLOBAL_POLICY = (
+    "そのラノベの**特徴として挙げられる場合のみ**採用すること。"
+    "端役・一時的な要素・微細な要素は対象外。"
+    "主要人物の関係・職業・性格、物語の核となる世界観・要素、作品形式に限る。"
+)
+
+
+def _format_tag_list_compact(items: list[dict] | None) -> str:
+    """Phase1/2 用のコンパクトなタグ一覧。
+    IMPORTANCE_ENABLED=True のときだけ重要度マーカーを付け、降順で並べる。"""
+    if not items:
+        return ""
+    if IMPORTANCE_ENABLED:
+        items_sorted = sorted(items, key=lambda it: -(it.get("importance") or 1))
+    else:
+        items_sorted = items
+    lines = []
+    for it in items_sorted:
+        name = (it.get("name") or "").strip()
+        if not name:
+            continue
+        desc = (it.get("description") or "").strip()
+        if IMPORTANCE_ENABLED:
+            importance = it.get("importance") or 1
+            if importance >= 3:
+                marker = " [重要度★★★]"
+            elif importance >= 2:
+                marker = " [重要度★★]"
+            else:
+                marker = ""
+        else:
+            marker = ""
+        head = f"  - {name}{marker}"
+        lines.append(f"{head}: {desc}" if desc else head)
+    return "\n".join(lines)
+
+
+def _build_series_meta_block(series_title: str,
+                              author: str | None,
+                              imprint: str | None,
+                              volume_count: int | None,
+                              book_section: str) -> str:
+    """全 Phase 共通の「シリーズ情報」ブロック。"""
+    return f"""シリーズ名: 「{series_title}」
+{f'レーベル: {imprint}' if imprint else ''}
+{f'著者: {author}' if author else ''}
+{f'既刊巻数: {volume_count}' if volume_count else ''}
+
+【シリーズ内書籍 (代表巻のタイトル + あらすじ抜粋)】
+{book_section}""".strip()
+
+
+def _parse_json_object(text: str | None) -> dict:
+    if not text:
+        return {}
+    m = re.search(r'\{[\s\S]*\}', text)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _phase1_wide_net(category_label: str,
+                     candidates: list[dict],
+                     series_meta: str,
+                     model: str,
+                     use_grounding: bool,
+                     extra_policy: str = "") -> list[str]:
+    """Phase 1: recall 重視で「該当しそうな」タグを広めに拾う。
+    extra_policy はカテゴリ固有のルール (例: sub_genre 共通ルール) を注入する。
+    """
+    if not candidates:
+        return []
+    tag_list = _format_tag_list_compact(candidates)
+    extra_block = f"\n【このカテゴリの適用ルール】\n{extra_policy}\n" if extra_policy else ""
+    prompt = f"""
+以下のライトノベル**シリーズ**について、「{category_label}」カテゴリの候補タグを「広めに」拾ってください。
+
+{series_meta}
+
+【候補タグリスト ({category_label})】
+{tag_list}
+{extra_block}
+【方針 — recall (拾い漏れ無し) を優先】
+- 確実ではなくても「該当しそうな気配がある」レベルは含めること
+- 主要要素だけでなく、副次的な要素も漏らさず候補に入れる
+- 後段で別途厳密判定するので、ここでは絞らない (precision はその時)
+- ただしリストにない名前は提案しない (新規タグは作らない)
+{_imp_phase1_rule()}
+
+【出力 (JSON のみ、コードフェンス禁止)】
+{{
+  "candidates": ["タグ名1", "タグ名2", ...]
+}}
+"""
+    text = _generate_with_retry(prompt, model=model, use_grounding=use_grounding)
+    data = _parse_json_object(text)
+    raw = data.get("candidates") or []
+    valid_names = {(it.get("name") or "").strip() for it in candidates}
+    return [n for n in raw if isinstance(n, str) and n in valid_names]
+
+
+def _phase2_verify(category_label: str,
+                   candidate_names: list[str],
+                   all_candidates: list[dict],
+                   series_meta: str,
+                   model: str,
+                   use_grounding: bool,
+                   extra_policy: str = "") -> list[str]:
+    """Phase 2: Phase1 の候補を厳密に判定し、根拠が確かなものだけ残す。
+    extra_policy はカテゴリ固有のルール (例: sub_genre 共通ルール) を注入する。
+    """
+    if not candidate_names:
+        return []
+    # 候補について description + importance を表示
+    by_name = {(it.get("name") or "").strip(): it for it in all_candidates}
+    items_for_prompt = [by_name[n] for n in candidate_names if n in by_name]
+    if not items_for_prompt:
+        return []
+    tag_list = _format_tag_list_compact(items_for_prompt)
+    extra_block = f"\n【このカテゴリの適用ルール】\n{extra_policy}\n" if extra_policy else ""
+    prompt = f"""
+以下のライトノベル**シリーズ**について、Phase1 で抽出された「{category_label}」候補タグを**厳密に判定**してください。
+
+{series_meta}
+
+【判定対象 (Phase1 抽出結果)】
+{tag_list}
+{extra_block}
+【方針 — precision (確実性) 優先】
+- 各タグについて、書籍情報に「明確な根拠」があるかを確認する
+- 根拠が薄い・推測・連想・「なんとなく合う」レベルなら除外する
+{_imp_phase2_rules()}
+- 量より質。確信できるものだけ残す
+- 候補リストに無いタグは加えないこと
+
+【出力 (JSON のみ、コードフェンス禁止)】
+{{
+  "tags": ["確定タグ1", "確定タグ2", ...]
+}}
+"""
+    text = _generate_with_retry(prompt, model=model, use_grounding=use_grounding)
+    data = _parse_json_object(text)
+    raw = data.get("tags") or []
+    valid = set(candidate_names)
+    return [n for n in raw if isinstance(n, str) and n in valid]
+
+
+def _phase2_verify_atmo_genre_with_scores(
+    atmosphere_candidates: list[str],
+    genre_candidates: list[str],
+    all_atmosphere: list[dict],
+    all_genre: list[dict],
+    series_meta: str,
+    score_anchors: list[dict] | None,
+    model: str,
+    use_grounding: bool,
+) -> dict:
+    """atmosphere + genre の Phase2 に 7軸スコア (popularity/momentum 除く) も乗せる。"""
+    atmo_by = {(it.get("name") or "").strip(): it for it in all_atmosphere}
+    genre_by = {(it.get("name") or "").strip(): it for it in all_genre}
+    atmo_items = [atmo_by[n] for n in atmosphere_candidates if n in atmo_by]
+    genre_items = [genre_by[n] for n in genre_candidates if n in genre_by]
+    atmo_list = _format_tag_list_compact(atmo_items)
+    genre_list = _format_tag_list_compact(genre_items)
+    anchor_block = _format_score_anchors(score_anchors, include_atmosphere=True)
+    anchor_section = f"\n{anchor_block}\n" if anchor_block else ""
+
+    prompt = f"""
+以下のライトノベル**シリーズ**について、Phase1 で抽出された atmosphere / genre 候補を厳密に判定し、
+同時に 6 軸の雰囲気スコア (0-100 or null) を生成してください。
+
+{series_meta}
+{anchor_section}
+【判定対象 — atmosphere】
+{atmo_list or '(なし)'}
+
+【判定対象 — genre】
+{genre_list or '(なし)'}
+
+【タグ判定方針 — precision 優先】
+- 各タグについて書籍情報に明確な根拠があるかを確認
+- 根拠が薄い・連想・「なんとなく合う」レベルなら除外
+{_imp_phase2_rules()}
+
+【雰囲気スコア — 0-100 の整数 or null】
+- comedy_score        : 笑える・軽快・コメディ要素の濃さ
+- serious_score       : 重いテーマ・葛藤・真剣さの濃さ
+- heartwarming_score  : 穏やかで安心感のある描写・ほのぼの度
+- bittersweet_score   : 報われない想い・別れ・切なさ
+- romantic_score      : 胸キュン・甘い恋愛描写
+- uplifting_score     : 高揚感 (感動 / 爽快 / 熱血 / カタルシス)
+
+【スコア粒度 — 厳守】
+- **1 刻みで細かく**評価 (47, 63, 78 など)
+- 0/5/10/20/50/70/90/100 のような丸い数字に偏らない
+- 判断材料不足・確信が持てない軸は **null** (0 と null を区別)
+
+【出力 (JSON のみ、コードフェンス禁止)】
+{{
+  "atmosphere_tags": ["..."],
+  "genre_tags": ["..."],
+  "comedy_score": 0-100 or null,
+  "serious_score": 0-100 or null,
+  "heartwarming_score": 0-100 or null,
+  "bittersweet_score": 0-100 or null,
+  "romantic_score": 0-100 or null,
+  "uplifting_score": 0-100 or null
+}}
+"""
+    text = _generate_with_retry(prompt, model=model, use_grounding=use_grounding)
+    data = _parse_json_object(text)
+    # 出力に含まれるタグだけ valid に絞る
+    valid_atmo = set(atmosphere_candidates)
+    valid_genre = set(genre_candidates)
+    out: dict = {
+        "atmosphere_tags": [n for n in (data.get("atmosphere_tags") or [])
+                             if isinstance(n, str) and n in valid_atmo],
+        "genre_tags":     [n for n in (data.get("genre_tags") or [])
+                             if isinstance(n, str) and n in valid_genre],
+    }
+    for k in ("comedy_score", "serious_score", "heartwarming_score",
+              "bittersweet_score", "romantic_score", "uplifting_score"):
+        out[k] = data.get(k)
+    return out
+
+
+def enrich_series_multipass(
+    series_title: str,
+    author: str | None = None,
+    imprint: str | None = None,
+    volume_count: int | None = None,
+    books: list[dict] | None = None,
+    atmosphere_candidates: list[dict] | None = None,
+    genre_candidates: list[dict] | None = None,
+    sub_genre_by_subcategory: dict[str, list[dict]] | None = None,
+    score_anchors: list[dict] | None = None,
+    model: str | None = None,
+    use_grounding: bool = False,
+    atmo_genre_model: str | None = None,
+    atmo_genre_grounding: bool | None = None,
+    sub_genre_model: str | None = None,
+    sub_genre_grounding: bool | None = None,
+) -> dict:
+    """multipass エンリッチ。
+    atmosphere+genre 1 ペア + sub_genre 各サブカテゴリ毎に Phase1+Phase2 で
+    精度を上げる。popularity/momentum はここでは扱わない (別 Phase 推奨)。
+
+    atmo+genre と sub_genre で別モデル・別 grounding を指定可能。
+    atmo_genre_model / sub_genre_model が None なら model にフォールバック
+    (それも None なら settings.gemini_parse_model)。
+
+    戻り値は enrich_openbd_series と同じ shape:
+      atmosphere_tags / genre_tags / sub_genre_tags /
+      comedy_score..uplifting_score / (popularity_score / momentum_score は None)
+    """
+    book_section = _format_books_for_prompt(books)
+    series_meta = _build_series_meta_block(
+        series_title, author, imprint, volume_count, book_section
+    )
+    fallback_mdl = model or settings.gemini_parse_model
+    atmo_mdl = atmo_genre_model or fallback_mdl
+    sub_mdl = sub_genre_model or fallback_mdl
+    atmo_grd = use_grounding if atmo_genre_grounding is None else atmo_genre_grounding
+    sub_grd = use_grounding if sub_genre_grounding is None else sub_genre_grounding
+
+    result: dict = {
+        "atmosphere_tags": [],
+        "genre_tags": [],
+        "sub_genre_tags": [],
+        "comedy_score": None, "serious_score": None,
+        "heartwarming_score": None, "bittersweet_score": None,
+        "romantic_score": None, "uplifting_score": None,
+        "popularity_score": None, "momentum_score": None,
+    }
+
+    # ---- atmosphere + genre (1ペア × 2 phase, atmo_mdl + atmo_grd) ----
+    atmo = atmosphere_candidates or []
+    genr = genre_candidates or []
+    if atmo or genr:
+        # Phase 1: atmosphere / genre をそれぞれ wide-net
+        p1_atmo = _phase1_wide_net(
+            "atmosphere (雰囲気)", atmo, series_meta, atmo_mdl, atmo_grd,
+        ) if atmo else []
+        p1_genre = _phase1_wide_net(
+            "genre (ジャンル)", genr, series_meta, atmo_mdl, atmo_grd,
+        ) if genr else []
+        # Phase 2: 候補をまとめて 1 call で検証 + スコア生成
+        p2 = _phase2_verify_atmo_genre_with_scores(
+            atmosphere_candidates=p1_atmo,
+            genre_candidates=p1_genre,
+            all_atmosphere=atmo,
+            all_genre=genr,
+            series_meta=series_meta,
+            score_anchors=score_anchors,
+            model=atmo_mdl,
+            use_grounding=atmo_grd,
+        )
+        result["atmosphere_tags"] = p2.get("atmosphere_tags", [])
+        result["genre_tags"] = p2.get("genre_tags", [])
+        for k in ("comedy_score", "serious_score", "heartwarming_score",
+                  "bittersweet_score", "romantic_score", "uplifting_score"):
+            result[k] = p2.get(k)
+
+    # ---- sub_genre: サブカテゴリ毎に 2 phase (sub_mdl + sub_grd) ----
+    sub_genre_final: list[str] = []
+    by_subcat = sub_genre_by_subcategory or {}
+    for subcat_key in SUB_GENRE_SUBCATEGORY_ORDER:
+        cands = by_subcat.get(subcat_key) or []
+        if not cands:
+            continue
+        label = f"sub_genre / {SUB_GENRE_SUBCATEGORY_LABELS.get(subcat_key, subcat_key)}"
+        p1 = _phase1_wide_net(label, cands, series_meta, sub_mdl, sub_grd,
+                              extra_policy=SUB_GENRE_GLOBAL_POLICY)
+        if not p1:
+            continue
+        p2 = _phase2_verify(label, p1, cands, series_meta, sub_mdl, sub_grd,
+                            extra_policy=SUB_GENRE_GLOBAL_POLICY)
+        sub_genre_final.extend(p2)
+    # 重複除去 (異なるサブカテゴリで同名が出ることは無いはずだが念のため)
+    seen = set()
+    dedup = []
+    for n in sub_genre_final:
+        if n in seen:
+            continue
+        seen.add(n)
+        dedup.append(n)
+    result["sub_genre_tags"] = dedup
+    return result
+
+
+def parse_detect_response(text: str | None) -> dict:
+    """detect_series_with_gemini の応答テキストを {groups, standalone} にパース。"""
+    if not text:
+        return {"groups": [], "standalone": []}
+    m = re.search(r'\{[\s\S]*\}', text)
+    if not m:
+        return {"groups": [], "standalone": []}
+    try:
+        data = json.loads(m.group())
+        if not isinstance(data, dict):
+            return {"groups": [], "standalone": []}
+        data.setdefault("groups", [])
+        data.setdefault("standalone", [])
+        return data
+    except json.JSONDecodeError:
+        return {"groups": [], "standalone": []}
+
+
 def detect_series_with_gemini(books: list[dict],
                               shared_names: list[str] | None = None,
                               imprint_hint: str | None = None,
                               model: str | None = None,
-                              use_grounding: bool = True) -> dict:
+                              use_grounding: bool = True,
+                              build_prompt_only: bool = False):
     """
     関連する書籍 (=同じ人物が役職問わず関わっている書籍) を Gemini に渡し、
     シリーズ構造に分類させる。
@@ -622,25 +1093,14 @@ JSON のみ、前後に説明文不要。
 - 確信がない書籍は standalone に入れる (推測でグループ化しない)
 - special_edition の attached_to_isbn は同 groups 内の main の ISBN を指す必要がある
 """
+    if build_prompt_only:
+        return prompt
     text = _generate_with_retry(
         prompt,
         model=model or settings.gemini_enrichment_model,
         use_grounding=use_grounding,
     )
-    if not text:
-        return {"groups": [], "standalone": []}
-    m = re.search(r'\{[\s\S]*\}', text)
-    if not m:
-        return {"groups": [], "standalone": []}
-    try:
-        data = json.loads(m.group())
-        if not isinstance(data, dict):
-            return {"groups": [], "standalone": []}
-        data.setdefault("groups", [])
-        data.setdefault("standalone", [])
-        return data
-    except json.JSONDecodeError:
-        return {"groups": [], "standalone": []}
+    return parse_detect_response(text)
 
 
 def enrich_series(series_title: str, author: str = None,
@@ -665,7 +1125,11 @@ def enrich_series(series_title: str, author: str = None,
 - 当てはまる表記をそのまま使うこと（同じ意味でも別表記にしない／表記揺れを作らない）
 - 各タグの説明文と作品内容を照合し、**確実に該当**するもののみ選ぶ
   （ストーリーや設定に明確に存在する要素だけ。推測・連想で付けない）
-- リストにない概念で作品の特徴として重要なものがあれば、新しいタグを追加してよい（最大3個まで）
+{_imp_main_rules()}
+- **新規タグ作成は原則禁止**。リストにない名前は提案しないこと。
+  ただし作品を象徴する核心的特徴で、他作品でも 5 件以上に使い回せる確信があり、
+  かつ既存タグの言い換え・細分化ではない場合に限り、**最大 1 個まで**新規追加してよい。
+  少しでも不確かなら作らない (精度優先)
 {tag_section}
 """
         if tag_section
@@ -759,6 +1223,7 @@ def enrich_series_popularity(
       {
         "popularity_score": 0-100 or null,
         "momentum_score": 0-100 or null,
+        "momentum_reason": "話題の根拠 or null",
         "rationale": "..."
       }
     """
@@ -816,22 +1281,48 @@ def enrich_series_popularity(
   -  15 前後: ほぼ無名
   -   0     : 情報なし
 
-【momentum_score: 直近の話題度】
-過去1年程度の作品の話題性・現役活動度を 0-100 で評価する。
-考慮要素:
-  - 直近1年程度の SNS / X (旧 Twitter) での言及量
-  - 最新巻の売れ行き・話題性
-  - 現在のファン活動度 (二次創作、感想等)
-  - 現在連載中か完結済みか
-  - 直近のメディア展開 (アニメ続編、コミカライズ最新刊等)
+【momentum_score: 直近の話題度 — popularity に対する「相対的な話題増分」で評価】
+過去1年程度の「今この作品が話題か」を 0-100 で評価する。
+**最重要ルール: popularity (累計知名度) が高いほど、momentum を高く付ける条件を厳しくする。**
+
+▽ popularity が高い作品 (おおむね 60 以上):
+  - 「有名だから」「固定ファンがいるから」という理由だけでは momentum を上げない。
+  - **わかりやすく具体的な直近の話題がある場合のみ**高くする。例:
+    新規アニメ化/映像化の発表・放送、コミカライズの開始や新刊、
+    電子/紙のセール・フェア実施中、新刊発売直後の大きな反響、
+    重版・実売好調の公表 など。
+  - **受賞 (新人賞/大賞/年間ランキング入賞/このラノ等) は、人気が高い作品でも
+    momentum を上げる正当な理由として認める。** 直近の受賞は積極的に反映する。
+  - 上記のような具体的な話題が検索で見つからなければ、有名でも momentum は
+    低め (おおむね 30 以下) に抑える。
+
+▽ popularity が低い作品 (おおむね 40 以下):
+  - **小さな信号でも momentum を上げてよい**。例:
+    X (旧 Twitter) で話題になった、売れ行きが良いと言われている、
+    賞を受賞した、新刊が好評、口コミで伸びている など。
+  - こうした兆候があれば popularity が低くても momentum を高め (70-90) に付ける。
+
+考慮する直近の話題 (要 Web 検索):
+  - アニメ化/映像化/コミカライズの新規発表・進行
+  - 電子/紙のセール・フェア (期間があれば日付も特定する)
+  - 受賞 (新人賞・年間ランキング等)
+  - X 等 SNS でのバズ・言及の増加
+  - 最新巻の売れ行き・重版
 時間軸: 過去1年〜現在
-基準値 (参考、実際の値は 1 刻みで細かく振る):
-  -  95 前後: 現在大バズり中・話題沸騰
-  -  75 前後: 直近で SNS 頻出
-  -  55 前後: 現役感あり・コミュニティ活発
-  -  35 前後: 細々と支持されている
-  -  15 前後: 直近話題はほぼない
-  -   0     : 現在事実上忘れられている
+基準値 (参考、1 刻みで微差を付ける):
+  -  90 前後: 明確な大型話題 (アニメ化決定/大バズり) が今ある
+  -  70 前後: 具体的な直近話題あり (セール中/受賞/コミカライズ新刊等)
+  -  45 前後: 現役感はあるが決定的な話題は無い
+  -  25 前後: 直近の目立つ話題はほぼ無い
+  -   0     : 事実上忘れられている
+
+【momentum_reason: 話題の根拠注釈】
+momentum を高め (おおむね 60 以上) に付けた場合、その**具体的な根拠**を短く記述する。
+例:「2026-07-31 まで電子書籍 50%OFF セール」「劇場アニメ化決定 (2026春)」
+   「コミカライズ第3巻発売・好評」「○○大賞 2025 受賞」「X で新刊が話題」。
+- 日付・回数・賞名など具体情報があれば必ず含める。
+- momentum が低い / 目立つ話題が無い場合は **null**。
+- Web 検索で裏が取れない憶測は書かない (確かな情報のみ)。
 
 【厳守 — 粒度とゼロ尊重】
 - 2軸を**別々に評価**する (popularity 高くても momentum 低い、その逆もあり得る)
@@ -846,6 +1337,7 @@ def enrich_series_popularity(
 {{
   "popularity_score": 0-100 or null,
   "momentum_score": 0-100 or null,
+  "momentum_reason": "話題の具体的根拠 (セール期限/映画化/受賞等)、無ければ null",
   "rationale": "1-2文で評価の判断根拠 (短く)"
 }}
 

@@ -417,9 +417,12 @@ def fetch_hanmoto_record(isbn: str, target_imprint: str, verbose: bool = False) 
     return _make_record_from_meta(isbn, meta)
 
 
-def filter_isbns_with_openbd(candidates: list[str], imprint: str) -> list[str]:
+def filter_isbns_with_openbd(
+    candidates: list[str], imprint: str
+) -> tuple[list[str], set[str], dict[str, dict]]:
     """openBDを「対象レーベル or 不明」のフィルタとしてのみ使う。
-    返り値は hanmoto で詳細取得すべきISBN一覧:
+    返り値: (hanmoto で詳細取得すべきISBN一覧, openBD確定ISBN集合, 確定ISBNのopenBDアイテム)
+    ISBN一覧の内訳:
       - openBD レコード無し → 不明として残す
       - imprint候補が空 → 不明として残す
       - matches_imprint(target) → 残す
@@ -427,6 +430,11 @@ def filter_isbns_with_openbd(candidates: list[str], imprint: str) -> list[str]:
     """
     print(f"[2/3] openBD でレーベル絞り込み (対象 '{imprint}' or 不明 を残す)")
     keep: list[str] = []
+    # openBD が厳密一致 (matches_imprint) で確定したISBNと、その openBD アイテム。
+    # hanmoto のラベルが短縮形 (例「富士見ファンタジア文庫」→hanmoto「ファンタジア文庫」)
+    # でも、これらは確定済みとして救済する。
+    confirmed_isbns: set[str] = set()
+    confirmed_items: dict[str, dict] = {}
     queried = 0
     confirmed = 0
     unknown = 0
@@ -452,6 +460,8 @@ def filter_isbns_with_openbd(candidates: list[str], imprint: str) -> list[str]:
             if matches_imprint(it, imprint):
                 keep.append(req_isbn)
                 confirmed += 1
+                confirmed_isbns.add(req_isbn)
+                confirmed_items[req_isbn] = it
             elif not _collect_imprint_candidates(it):
                 keep.append(req_isbn)
                 unknown += 1
@@ -460,18 +470,25 @@ def filter_isbns_with_openbd(candidates: list[str], imprint: str) -> list[str]:
 
     print(f"  → 照会 {queried:,}件: 対象一致 {confirmed:,} / 不明 {unknown:,} / 別レーベル除外 {rejected:,}")
     print(f"  → hanmoto詳細取得対象: {len(keep):,}件")
-    return keep
+    return keep, confirmed_isbns, confirmed_items
 
 
 def fetch_all_from_hanmoto(isbns: list[str], imprint: str, limit: int | None,
                            other_target_labels: set[str] | None = None,
-                           concurrency: int | None = None
+                           concurrency: int | None = None,
+                           openbd_confirmed: set[str] | None = None,
+                           openbd_items: dict[str, dict] | None = None
                            ) -> tuple[list[dict], list[dict], list[str]]:
     """hanmoto から各ISBNを並列取得。
     返り値: (target一致, opportunistic, attempted_isbns)
 
     other_target_labels: 「収集対象だが今回のレーベルではない」レーベル名集合。
     concurrency: 並列接続数 (デフォルト HANMOTO_CONCURRENCY=5)。
+    openbd_confirmed: openBD が厳密一致で確定したISBN集合。これらは hanmoto の
+      ラベルが短縮形でも (例: target「富士見ファンタジア文庫」/ hanmoto「ファンタジア文庫」)
+      target として採用する。ただし hanmoto が「別の収集対象レーベル名」を明示した
+      場合はそちらを優先 (opportunistic) して openBD 誤検出を救済する。
+    openbd_items: 確定ISBNの openBD アイテム。hanmoto 取得失敗時の fallback 構築用。
     """
     if concurrency is None:
         concurrency = HANMOTO_CONCURRENCY
@@ -480,6 +497,9 @@ def fetch_all_from_hanmoto(isbns: list[str], imprint: str, limit: int | None,
     opportunistic: list[dict] = []
     attempted: list[str] = []
     others = set(other_target_labels or [])
+    confirmed_set = set(openbd_confirmed or ())
+    items_by_isbn = openbd_items or {}
+    rescued = 0  # openBD確定だが hanmoto ラベル不一致/取得失敗を救済した数
 
     imprint_norm = _imprint_norm(imprint)
     others_norm = {other: _imprint_norm(other) for other in others}
@@ -497,35 +517,68 @@ def fetch_all_from_hanmoto(isbns: list[str], imprint: str, limit: int | None,
             completed += 1
             isbn = future_to_isbn[fut]
             attempted.append(isbn)
+            is_confirmed = isbn in confirmed_set
             try:
                 meta = fut.result()
             except Exception:
                 meta = None
             if not meta or not meta.get("label"):
+                # hanmoto 取得失敗。openBD 確定なら openBD データから救済構築。
+                if is_confirmed and isbn in items_by_isbn:
+                    orec = extract_record(items_by_isbn[isbn], target_imprint=imprint)
+                    if orec and orec.get("title"):
+                        orec["imprint"] = imprint
+                        matched.append(orec)
+                        rescued += 1
                 continue
             label = meta["label"]
             label_norm = _imprint_norm(label)
             rec = _make_record_from_meta(isbn, meta)
 
+            # hanmoto が「別の収集対象レーベル名」を明示しているか
+            opp_label = None
+            for other, other_norm in others_norm.items():
+                if other_norm in label_norm:
+                    opp_label = other
+                    break
+
             if imprint_norm in label_norm:
+                # openBD・hanmoto 双方が一致
                 matched.append(rec)
                 if len(matched) <= 5 or len(matched) % 50 == 0:
                     print(f"  [{completed}/{len(isbns)}] match: {isbn} 「{rec['title']}」 "
                           f"著={rec.get('author')} 絵={rec.get('illustrator')} "
                           f"(累計 {len(matched)})")
-            elif others:
-                for other, other_norm in others_norm.items():
-                    if other_norm in label_norm:
-                        opportunistic.append(rec)
-                        if len(opportunistic) <= 5 or len(opportunistic) % 20 == 0:
-                            print(f"  [{completed}/{len(isbns)}] opportunistic ({other}): "
-                                  f"{isbn} 「{rec['title']}」 (累計 {len(opportunistic)})")
-                        break
+            elif opp_label and not is_confirmed:
+                # openBD 未確定 + hanmoto が別レーベルを明示 → そのレーベル下に保存
+                opportunistic.append(rec)
+                if len(opportunistic) <= 5 or len(opportunistic) % 20 == 0:
+                    print(f"  [{completed}/{len(isbns)}] opportunistic ({opp_label}): "
+                          f"{isbn} 「{rec['title']}」 (累計 {len(opportunistic)})")
+            elif opp_label and is_confirmed:
+                # 競合 (openBD=本レーベル / hanmoto=別レーベル) → hanmoto を優先
+                opportunistic.append(rec)
+                if len(opportunistic) <= 5 or len(opportunistic) % 20 == 0:
+                    print(f"  [{completed}/{len(isbns)}] opportunistic({opp_label}/openBD競合): "
+                          f"{isbn} 「{rec['title']}」 (累計 {len(opportunistic)})")
+            elif is_confirmed:
+                # openBD 確定 + hanmoto は短縮形/不明ラベル → target として採用。
+                # imprint は正規名 (target) に上書きして表記を統一。
+                rec["imprint"] = imprint
+                rec["raw"]["openbd_confirmed"] = True
+                rec["raw"]["hanmoto_label"] = label
+                matched.append(rec)
+                rescued += 1
+                if rescued <= 5 or rescued % 50 == 0:
+                    print(f"  [{completed}/{len(isbns)}] rescue: {isbn} 「{rec['title']}」 "
+                          f"(hanmoto='{label}' → '{imprint}') (救済 {rescued})")
             if limit and len(matched) >= limit:
                 print(f"  → limit {limit} 到達 (残りの fetch は完了を待たずに中断)")
                 # 中断 (残り Future はガベージコレクションで破棄される)
                 ex.shutdown(wait=False, cancel_futures=True)
                 break
+    if rescued:
+        print(f"  → openBD確定の救済: {rescued}件 (hanmotoラベル不一致でも target として保存)")
     return matched, opportunistic, attempted
 
 
@@ -611,7 +664,7 @@ def process_label(imprint: str, candidates: list[str], dry_run: bool,
         candidates = [i for i in candidates if i not in skip_existing_set]
         print(f"  → DB既存+セッション既取得 {len(skip_existing_set):,}件を除外 ({before:,} → {len(candidates):,})")
 
-    keep = filter_isbns_with_openbd(candidates, imprint)
+    keep, confirmed_isbns, confirmed_items = filter_isbns_with_openbd(candidates, imprint)
     if hanmoto_max:
         keep = keep[:hanmoto_max]
         print(f"  → --hanmoto-max {hanmoto_max} 適用 → {len(keep):,}件")
@@ -620,6 +673,8 @@ def process_label(imprint: str, candidates: list[str], dry_run: bool,
         keep, imprint, limit,
         other_target_labels=other_target_labels,
         concurrency=concurrency,
+        openbd_confirmed=confirmed_isbns,
+        openbd_items=confirmed_items,
     )
     print(f"\n[一致確認] {imprint}: 主一致 {len(matched_records)}件 / "
           f"opportunistic {len(opportunistic_records)}件 / hanmoto試行 {len(attempted):,}件")
