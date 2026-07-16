@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     # OpenAI (ベクトル埋め込み専用。タグ・スコア判定は Gemini を使う)
     openai_api_key: str = ""
     openai_embedding_model: str = "text-embedding-3-small"
+    # 6観点 (facet) ベクトルは言い換え耐性のため large(3072) を使う
+    openai_aspect_embedding_model: str = "text-embedding-3-large"
+    aspect_embedding_dim: int = 3072
 
     # xAI Grok (Live Search でレビュー収集の実験用)
     xai_api_key: str = ""

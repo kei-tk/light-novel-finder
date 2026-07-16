@@ -65,8 +65,11 @@ export default function SearchPage() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);  // semantic「さらに見る」用
   const [error, setError] = useState<string | null>(null);
 
+  const isSemantic = searchMode === "semantic" && !!submittedQuery;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   // タグ一覧をロード
@@ -104,14 +107,14 @@ export default function SearchPage() {
     return p;
   }, [selectedGenres, selectedAtmospheres, selectedSubGenres, sort, scores, page]);
 
-  // 結果取得 (キーワード優先)
+  // 結果取得 (キーワード優先)。semantic は offset=0 で取り直し「さらに見る」で追記する
   useEffect(() => {
     setLoading(true);
     setError(null);
     const offset = (page - 1) * PAGE_SIZE;
     const fetcher = submittedQuery
       ? searchMode === "semantic"
-        ? semanticSearch(submittedQuery, PAGE_SIZE, selectedGenres)
+        ? semanticSearch(submittedQuery, { genres: selectedGenres, offset: 0, limit: PAGE_SIZE })
         : searchSeries(submittedQuery, { limit: PAGE_SIZE, offset })
       : fetchSeriesList(params);
     fetcher
@@ -119,10 +122,24 @@ export default function SearchPage() {
         setSeries(r.data.series);
         const t = (r.data as { total?: number }).total;
         setTotal(t ?? r.data.series.length);
+        setHasMore(Boolean((r.data as { has_more?: boolean }).has_more));
       })
       .catch((e) => setError(String(e?.message ?? e)))
       .finally(() => setLoading(false));
   }, [submittedQuery, searchMode, params, page]);
+
+  // 「さらに見る」: 関連度順の続きを取得して追記
+  const loadMore = () => {
+    if (loadingMore || !isSemantic) return;
+    setLoadingMore(true);
+    semanticSearch(submittedQuery, { genres: selectedGenres, offset: series.length, limit: PAGE_SIZE })
+      .then((r) => {
+        setSeries((prev) => [...prev, ...r.data.series]);
+        setHasMore(Boolean(r.data.has_more));
+      })
+      .catch((e) => setError(String(e?.message ?? e)))
+      .finally(() => setLoadingMore(false));
+  };
 
   // ページ変更時はスクロールを上に戻す
   useEffect(() => {
@@ -266,17 +283,34 @@ export default function SearchPage() {
             <h3 className="font-rounded font-bold text-ink mb-3 flex items-center gap-2">
               <span>↕</span> 並び順
             </h3>
-            <select
-              value={sort}
-              onChange={(e) => setSort(e.target.value as ListParams["sort"])}
-              className="w-full rounded-2xl bg-white border-2 border-cream-100 px-4 py-2.5
-                         font-rounded focus:outline-none focus:border-primary-400"
-            >
-              <option value="popularity">人気の高い順</option>
-              <option value="momentum">話題度の高い順</option>
-              <option value="new">新しい順</option>
-              <option value="title">タイトル順</option>
-            </select>
+            {searchMode === "semantic" ? (
+              // AI意味検索は常に関連度順 (並び順は適用されない)
+              <>
+                <select
+                  value="relevance"
+                  disabled
+                  className="w-full rounded-2xl bg-cream-50 border-2 border-cream-100 px-4 py-2.5
+                             font-rounded text-ink-muted cursor-not-allowed"
+                >
+                  <option value="relevance">関連度の高い順</option>
+                </select>
+                <p className="text-xs text-ink-muted font-rounded mt-1.5">
+                  🪄 AI検索はクエリとの関連度順で表示されます
+                </p>
+              </>
+            ) : (
+              <select
+                value={sort}
+                onChange={(e) => setSort(e.target.value as ListParams["sort"])}
+                className="w-full rounded-2xl bg-white border-2 border-cream-100 px-4 py-2.5
+                           font-rounded focus:outline-none focus:border-primary-400"
+              >
+                <option value="popularity">人気の高い順</option>
+                <option value="momentum">話題度の高い順</option>
+                <option value="new">新しい順</option>
+                <option value="title">タイトル順</option>
+              </select>
+            )}
           </div>
 
           <button
@@ -296,9 +330,11 @@ export default function SearchPage() {
               )}
               {loading
                 ? "..."
-                : total > 0
-                ? `全 ${total} 件 (${page} / ${totalPages} ページ)`
-                : "0 件"}
+                : total === 0
+                ? "0 件"
+                : isSemantic
+                ? `関連度順 ${series.length} 件を表示中${hasMore ? "（さらに見るで続きを表示）" : ""}`
+                : `全 ${total} 件 (${page} / ${totalPages} ページ)`}
             </p>
           </div>
 
@@ -319,11 +355,25 @@ export default function SearchPage() {
                   <SeriesCard key={s.id} series={s} />
                 ))}
               </div>
-              <Pagination
-                current={page}
-                totalPages={totalPages}
-                onChange={setPage}
-              />
+              {isSemantic ? (
+                hasMore && (
+                  <div className="flex justify-center mt-8">
+                    <button
+                      onClick={loadMore}
+                      disabled={loadingMore}
+                      className="chip bg-primary-500 text-white hover:bg-primary-600 px-6 py-2 font-rounded font-bold disabled:opacity-60"
+                    >
+                      {loadingMore ? "読み込み中…" : "さらに見る"}
+                    </button>
+                  </div>
+                )
+              ) : (
+                <Pagination
+                  current={page}
+                  totalPages={totalPages}
+                  onChange={setPage}
+                />
+              )}
             </>
           )}
         </section>

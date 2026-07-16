@@ -95,12 +95,13 @@ def _normalize_rows(m: np.ndarray) -> np.ndarray:
 import os
 import json
 
-# ローカルキャッシュ (DB から毎回 300MB 転送するのを避ける)
+# ベクトルキャッシュは「永続データ資産」として backend/data/ に置く。
+# ephemeral な cache/ と違い TTL で失効させず、DB を編集したときだけ
+# scripts.rebuild_vector_cache で明示的に更新する (公開デプロイもこのファイルを配布)。
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), "cache", "vector_cache")
+    os.path.abspath(__file__)))), "data", "vector_cache")
 _NPZ_PATH = os.path.join(_CACHE_DIR, "facets.npz")
 _META_PATH = os.path.join(_CACHE_DIR, "meta.json")
-_DISK_TTL_SEC = 24 * 3600  # ディスクキャッシュの有効期限 (新データ取込のため)
 
 
 def _save_cache():
@@ -124,8 +125,9 @@ def _try_load_cache() -> bool:
     try:
         with open(_META_PATH, encoding="utf-8") as f:
             meta = json.load(f)
-        if time.time() - meta.get("built_at", 0) > _DISK_TTL_SEC:
-            return False
+        # TTL で失効させて DB 再取得すると、リクエスト経路で約600MB(6観点×3072次元)を
+        # 同期転送してワーカーがブロックし検索がタイムアウトする。よって古くても .npz を
+        # 常に即ロードする (stale-while-serve)。新データ反映は rebuild_cache() を明示実行する。
         npz = np.load(_NPZ_PATH)
         _mats = {f: npz[f] for f in FACETS}
         _ids = meta["ids"]
@@ -165,7 +167,7 @@ def _fetch_from_db() -> None:
         rows = rs.data or []
         for r in rows:
             vecs = {f: _parse_vec(r.get(_FACET_COL[f])) for f in FACETS}
-            if any(v is None or len(v) != 1536 for v in vecs.values()):
+            if any(v is None or len(v) != settings.aspect_embedding_dim for v in vecs.values()):
                 continue
             ids.append(r["id"])
             for f in FACETS:
@@ -181,7 +183,7 @@ def _fetch_from_db() -> None:
         offset += page
     _ids = ids
     _mats = {f: (_normalize_rows(np.asarray(raw[f], dtype=np.float32))
-                 if raw[f] else np.zeros((0, 1536), dtype=np.float32))
+                 if raw[f] else np.zeros((0, settings.aspect_embedding_dim), dtype=np.float32))
              for f in FACETS}
     _genre_sets = gsets
     _genre_only = gonly
@@ -228,7 +230,9 @@ def _ensure_facet_descriptors() -> dict[str, np.ndarray]:
 
 
 def _embed(text: str) -> list[float]:
-    return _openai.embeddings.create(model=settings.openai_embedding_model, input=text).data[0].embedding
+    # facet 空間は aspect モデル (text-embedding-3-large, 3072) に統一
+    return _openai.embeddings.create(model=settings.openai_aspect_embedding_model,
+                                     input=text).data[0].embedding
 
 
 def ready() -> bool:
@@ -304,22 +308,65 @@ def _topk_from_scores(scores: np.ndarray, limit: int, exclude: set[str],
     return out
 
 
-# ============================ semantic ============================
-def semantic(query: str, limit: int = 12,
-             genres: list[str] | None = None) -> list[tuple[str, float]]:
-    """自然言語クエリ → 各 facet に当て、クエリ内容で重みを変えて合成。"""
-    _load()
-    if not _mats or _mats[FACETS[0]].shape[0] == 0:
-        return []
+def _scores_by_split(query: str) -> np.ndarray | None:
+    """クエリを6観点サブクエリに分割 (gpt-5.5) し、各サブクエリを embedding して対応 facet と
+    照合した合算スコアを返す。分割失敗時は None (重み方式へフォールバック)。"""
+    from app.services import query_splitter
+    subs = query_splitter.split(query)
+    if not subs:
+        return None
+    active = [(f, t) for f, t in subs.items() if t]
+    if not active:
+        return None
+    # 各サブクエリをまとめて 1回で embedding
+    if not _openai:
+        return None
+    resp = _openai.embeddings.create(model=settings.openai_aspect_embedding_model,
+                                     input=[t for _, t in active])
+    scores = np.zeros(len(_ids), dtype=np.float32)
+    for (f, _), d in zip(active, resp.data):
+        v = np.asarray(d.embedding, dtype=np.float32)
+        n = np.linalg.norm(v)
+        if n:
+            v = v / n
+        scores += _mats[f] @ v   # 対応 facet との cosine を加算
+    return scores
+
+
+def _scores_by_weight(query: str) -> np.ndarray | None:
+    """フォールバック: クエリ1回 embedding を facet 重みで合成。"""
     q = _normed_query(query)
     if q is None:
-        return []
+        return None
     weights = _facet_weights_for_query(q)
     scores = np.zeros(len(_ids), dtype=np.float32)
     for f in FACETS:
-        scores += weights[f] * (_mats[f] @ q)  # facet 別 cosine の加重和
+        scores += weights[f] * (_mats[f] @ q)
+    return scores
+
+
+def semantic(query: str,
+             genres: list[str] | None = None) -> list[tuple[str, float]]:
+    """自然言語クエリ検索。クエリを6観点サブクエリに分割して各 facet に照合する
+    (失敗時は facet 重み方式へフォールバック)。件数で区切らず関連度順で全件返し、
+    表示は API/フロントの offset/limit で『さらに見る』式に小出しにする。"""
+    _load()
+    if not _mats or _mats[FACETS[0]].shape[0] == 0:
+        return []
+    scores = _scores_by_split(query)
+    if scores is None:
+        scores = _scores_by_weight(query)
+    if scores is None:
+        return []
     mask = _genre_mask(genres, None)
-    return _topk_from_scores(scores, limit, set(), mask)
+
+    order = np.argsort(-scores)
+    out: list[tuple[str, float]] = []
+    for idx in order:
+        if mask is not None and not mask[idx]:
+            continue
+        out.append((_ids[idx], float(scores[idx])))
+    return out
 
 
 # ============================ similar ============================

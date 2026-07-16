@@ -1,0 +1,38 @@
+[Unit]
+# Ranobe Finder バックエンド (FastAPI + uvicorn)
+# 配置: /etc/systemd/system/ranobe-backend.service
+Description=Ranobe Finder backend (FastAPI/uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# デプロイ用の一般ユーザー (root 以外) を指定する
+User=ranobe
+Group=ranobe
+
+# リポジトリを /opt/ranobe に clone した想定。実際の配置に合わせて変更する。
+WorkingDirectory=/opt/ranobe/backend
+
+# API キー等は backend/.env に置く (git 管理外)。systemd が読み込む。
+EnvironmentFile=/opt/ranobe/backend/.env
+
+# 600MB のベクトルを常駐させるため worker は 1 に固定する
+# (複数 worker にすると各プロセスが 600MB ずつ確保しメモリが枯渇する)。
+# 127.0.0.1 のみで待受け、外部公開は Caddy/nginx のリバースプロキシ経由にする。
+ExecStart=/opt/ranobe/backend/venv/bin/python -m uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 --workers 1 \
+    --proxy-headers --forwarded-allow-ips=127.0.0.1 \
+    --timeout-keep-alive 30
+
+Restart=always
+RestartSec=5
+# 起動時に .npz(約600MB) をロードするため猶予を長めに
+TimeoutStartSec=120
+
+# 簡易ハードニング
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

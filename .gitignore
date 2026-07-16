@@ -62,8 +62,12 @@ tmp/
 scratch/
 
 # ========== データ・キャッシュ (再生成可能 / 大容量、コミットしない) ==========
-# ベクトル .npz (302MB) / 要約・観点 JSONL。正本は DB
+# ベクトル .npz / 要約・観点 JSONL。正本は DB
 backend/cache/
+# 永続データ資産 (backend/data/vector_cache) — 604MB でGitHub上限超のため
+# バイナリ本体はコミットせず、ディレクトリ構成と README・rebuild スクリプトのみ管理する
+backend/data/vector_cache/*.npz
+backend/data/vector_cache/meta.json
 # タグ等のバックアップ JSON
 backend/backups/
 # バッチ実行の一時状態

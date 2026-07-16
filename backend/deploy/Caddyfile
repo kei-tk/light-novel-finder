@@ -1,0 +1,33 @@
+# Ranobe Finder 公開用リバースプロキシ (自動HTTPS)
+# 配置: /etc/caddy/Caddyfile
+#
+# フロント(静的)とAPI を同一ドメインで配信する (CORS 不要)。
+# アクセス制限は付けない = URL を知っていれば誰でも閲覧可。
+#
+# ホスト名は Azure が無料で払い出す DNS名 (例 ranobe-xxx.japaneast.cloudapp.azure.com)
+# をそのまま使える (独自ドメイン購入は不要)。下の行を自分の値に置き換える。
+
+ranobe-xxx.japaneast.cloudapp.azure.com {
+    encode gzip
+
+    # 検索エンジンにインデックスさせない (広く拡散させない補助。アクセス自体は誰でも可)
+    header X-Robots-Tag "noindex, nofollow"
+
+    # --- API はバックエンド(uvicorn)へ ---
+    # 自然言語検索は 6〜11 秒かかることがあるためタイムアウトを長めに
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8000 {
+            transport http {
+                read_timeout 60s
+                write_timeout 60s
+            }
+        }
+    }
+
+    # --- それ以外はフロントの静的ファイル (React SPA) ---
+    handle {
+        root * /opt/ranobe/frontend/dist
+        try_files {path} /index.html
+        file_server
+    }
+}

@@ -11,6 +11,22 @@ router = APIRouter(prefix="/series", tags=["series"])
 # 最新刊の新しさによる重みの半減期 (年)。これだけ古くなると表示確率が半分。
 _RECENCY_HALFLIFE_YEARS = 2.0
 
+# 一覧・詳細で返す列。8本のベクトル列 (embedding 系) と巨大 JSONB の raw は除外する。
+# vector(3072)×6 + 単体ベクトルは 1行あたり数百KB の JSON になり、SELECT * だと
+# プール 120件で十数MB を毎回転送・パースして応答が 8〜9秒に膨らむ。
+# 検索用ベクトルは vector_search がインメモリで別途保持するため API では返さない。
+_COLS = (
+    "id,series_title,author,illustrator,contributors,publisher,imprint,"
+    "cover_image_url,description,volume_count,first_published_date,latest_published_date,"
+    "synopsis,atmosphere_tags,genre_tags,sub_genre_tags,target_audience,"
+    "created_at,updated_at,normalized_title,is_series,parent_series_id,is_special_edition,"
+    "comedy_score,serious_score,heartwarming_score,bittersweet_score,romantic_score,"
+    "uplifting_score,popularity_score,tagline,momentum_score,momentum_reason,"
+    "embedding_source,embedded_at,review_summary,review_summary_model,review_sources,"
+    "review_embedded_at,plot_text,cast_text,theme_text,mood_text,reader_text,"
+    "review_aspect_text,aspect_source,aspect_built_at"
+)
+
 
 def _sample(rows: list[dict], limit: int) -> list[dict]:
     """上位候補プールから limit 件をランダム抽出 (ホーム表示にランダム性を持たせる)。
@@ -123,7 +139,7 @@ def list_series(
     """シリーズ一覧 (フィルタ + ソート)。タグはカンマ区切りで複数指定=AND 絞り込み。"""
     supabase = get_supabase()
     # ページネーション用に total を返したいので count=exact
-    query = supabase.table("openbd_test_series").select("*", count="exact")
+    query = supabase.table("openbd_test_series").select(_COLS, count="exact")
 
     # parent_series_id が NULL の (= 親シリーズ) のみ返す。サブシリーズは詳細から辿る
     query = query.is_("parent_series_id", "null")
@@ -172,7 +188,7 @@ def new_releases(limit: int = Query(12, le=50)):
     """新刊シリーズ (最新巻発売日が新しい順の上位プールからランダム抽出)。"""
     supabase = get_supabase()
     pool = min(max(limit * 4, 40), 100)
-    result = supabase.table("openbd_test_series").select("*") \
+    result = supabase.table("openbd_test_series").select(_COLS) \
         .is_("parent_series_id", "null") \
         .not_.is_("latest_published_date", "null") \
         .order("latest_published_date", desc=True, nullsfirst=False) \
@@ -185,7 +201,7 @@ def trending(limit: int = Query(12, le=50)):
     """話題のシリーズ (momentum_score 上位プールからランダム抽出)。"""
     supabase = get_supabase()
     pool = min(max(limit * 6, 60), 120)
-    result = supabase.table("openbd_test_series").select("*") \
+    result = supabase.table("openbd_test_series").select(_COLS) \
         .is_("parent_series_id", "null") \
         .not_.is_("momentum_score", "null") \
         .order("momentum_score", desc=True, nullsfirst=False) \
@@ -198,7 +214,7 @@ def recommended(limit: int = Query(12, le=50)):
     """おすすめ (popularity_score 上位プールからランダム抽出した定番シリーズ)。"""
     supabase = get_supabase()
     pool = min(max(limit * 6, 60), 120)
-    result = supabase.table("openbd_test_series").select("*") \
+    result = supabase.table("openbd_test_series").select(_COLS) \
         .is_("parent_series_id", "null") \
         .not_.is_("popularity_score", "null") \
         .order("popularity_score", desc=True, nullsfirst=False) \
@@ -216,7 +232,7 @@ def search(
     supabase = get_supabase()
     # PostgREST の OR 文法: or=(field1.ilike.%q%,field2.ilike.%q%)
     pattern = f"%{q}%"
-    result = supabase.table("openbd_test_series").select("*", count="exact") \
+    result = supabase.table("openbd_test_series").select(_COLS, count="exact") \
         .is_("parent_series_id", "null") \
         .or_(f"series_title.ilike.{pattern},author.ilike.{pattern}") \
         .order("popularity_score", desc=True, nullsfirst=False) \
@@ -234,7 +250,7 @@ def _fetch_series_ordered(ids: list[str]) -> list[dict]:
     """series_id のリストを順序維持で取得し、最新カバーを付与。"""
     if not ids:
         return []
-    rows = get_supabase().table("openbd_test_series").select("*") \
+    rows = get_supabase().table("openbd_test_series").select(_COLS) \
         .in_("id", ids).execute().data or []
     by_id = {r["id"]: r for r in rows}
     ordered = [by_id[i] for i in ids if i in by_id]
@@ -244,17 +260,26 @@ def _fetch_series_ordered(ids: list[str]) -> list[dict]:
 @router.get("/semantic")
 def semantic_search(
     q: str = Query(..., min_length=1, description="自然言語クエリ"),
-    limit: int = Query(24, le=60),
     genre: str | None = Query(None, description="ジャンル絞り込み (カンマ区切りで OR)"),
+    limit: int = Query(48, le=120, description="1ページの件数"),
+    offset: int = Query(0, ge=0, description="さらに見る用オフセット"),
 ):
-    """自然言語クエリでのハイブリッド類似検索 (レビュー要約ベクトル + ジャンル絞り込み)。
-
-    例: q='感動して泣ける爽やかな青春物' genre='百合'
+    """自然言語クエリでのハイブリッド類似検索 (6観点ベクトル + ジャンル絞り込み)。
+    候補を関連度順に並べ、offset/limit で『さらに見る』式に返す。件数では区切らない。
+    total は候補総数 (まだ続きがあるか判定用)。
     """
     from app.services import vector_search
     genres = [g.strip() for g in genre.split(",") if g.strip()] if genre else None
-    hits = vector_search.semantic(q, limit, genres=genres)
-    return {"query": q, "series": _fetch_series_ordered([sid for sid, _ in hits])}
+    hits = vector_search.semantic(q, genres=genres)
+    total = len(hits)
+    page = hits[offset:offset + limit]
+    return {
+        "query": q,
+        "series": _fetch_series_ordered([sid for sid, _ in page]),
+        "total": total,
+        "offset": offset,
+        "has_more": offset + len(page) < total,
+    }
 
 
 @router.get("/{series_id}/similar")
@@ -305,7 +330,7 @@ def list_tags():
 def get_series(series_id: str):
     """シリーズ詳細 (巻一覧 + サブシリーズ付き)。"""
     supabase = get_supabase()
-    result = supabase.table("openbd_test_series").select("*") \
+    result = supabase.table("openbd_test_series").select(_COLS) \
         .eq("id", series_id).maybe_single().execute()
     if not result or not result.data:
         raise HTTPException(status_code=404, detail="シリーズが見つかりません")

@@ -151,12 +151,24 @@ export const fetchSeriesDetail = (id: string) =>
 
 // ---------- ベクトル検索 (類似 / 自然言語 / おすすめ) ----------
 
-export const semanticSearch = (q: string, limit = 24, genres?: string[]) =>
-  apiClient.get<{ query: string; series: Series[] }>("/series/semantic", {
+// 関連度しきい値以上をランク順に返す。offset/limit で「さらに見る」式に取得する。
+export const semanticSearch = (
+  q: string,
+  opts?: { genres?: string[]; offset?: number; limit?: number; minRatio?: number }
+) =>
+  apiClient.get<{
+    query: string;
+    series: Series[];
+    total: number;
+    offset: number;
+    has_more: boolean;
+  }>("/series/semantic", {
     params: {
       q,
-      limit,
-      ...(genres && genres.length ? { genre: genres.join(",") } : {}),
+      ...(opts?.offset != null ? { offset: opts.offset } : {}),
+      ...(opts?.limit != null ? { limit: opts.limit } : {}),
+      ...(opts?.minRatio != null ? { min_ratio: opts.minRatio } : {}),
+      ...(opts?.genres && opts.genres.length ? { genre: opts.genres.join(",") } : {}),
     },
   });
 
