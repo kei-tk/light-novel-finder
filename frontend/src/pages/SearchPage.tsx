@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   fetchSeriesList,
@@ -51,6 +51,12 @@ export default function SearchPage() {
   const [selectedSubGenres, setSelectedSubGenres] = useState<string[]>(
     () => parseTagParam(searchParams.get("sub_genre"))
   );
+  // semantic 用: AI が推定した AND/OR。ユーザーがトグルで上書き可能
+  const [genreMode, setGenreMode] = useState<"and" | "or">("or");
+  // ジャンルをユーザーが手動編集したか。false の間は AI 推定を使う (true で上書き送信)
+  const genreOverrideRef = useRef(false);
+  // semantic 再検索のトリガ (ジャンル/モードのユーザー編集時に bump)
+  const [semanticTick, setSemanticTick] = useState(0);
   const [sort, setSort] = useState<ListParams["sort"]>("popularity");
   const [scores, setScores] = useState<Record<ScoreKey, number>>({
     min_comedy: 0,
@@ -79,6 +85,7 @@ export default function SearchPage() {
 
   // URL クエリ変化時に state を同期 (詳細ページからのリンク遷移用)
   useEffect(() => {
+    genreOverrideRef.current = false;  // 新規遷移では AI 推定に戻す
     setKeyword(searchParams.get("q") ?? "");
     setSubmittedQuery(searchParams.get("q") ?? "");
     setSelectedGenres(parseTagParam(searchParams.get("genre")));
@@ -107,15 +114,14 @@ export default function SearchPage() {
     return p;
   }, [selectedGenres, selectedAtmospheres, selectedSubGenres, sort, scores, page]);
 
-  // 結果取得 (キーワード優先)。semantic は offset=0 で取り直し「さらに見る」で追記する
+  // 結果取得 (一覧 / キーワード)。semantic は下の専用 effect で扱う
   useEffect(() => {
+    if (searchMode === "semantic" && submittedQuery) return;  // semantic は別 effect
     setLoading(true);
     setError(null);
     const offset = (page - 1) * PAGE_SIZE;
     const fetcher = submittedQuery
-      ? searchMode === "semantic"
-        ? semanticSearch(submittedQuery, { genres: selectedGenres, offset: 0, limit: PAGE_SIZE })
-        : searchSeries(submittedQuery, { limit: PAGE_SIZE, offset })
+      ? searchSeries(submittedQuery, { limit: PAGE_SIZE, offset })
       : fetchSeriesList(params);
     fetcher
       .then((r) => {
@@ -128,11 +134,60 @@ export default function SearchPage() {
       .finally(() => setLoading(false));
   }, [submittedQuery, searchMode, params, page]);
 
-  // 「さらに見る」: 関連度順の続きを取得して追記
+  // semantic 専用: 新規クエリ/モード切替、またはジャンル・AND/OR のユーザー編集(semanticTick)で発火。
+  // override=false の間は genre を送らず AI に推定させ、応答の genres/genre_mode を UI に反映する。
+  // override=true (ユーザー編集後) は選択中のタグ/モードをそのまま送る。
+  // selectedGenres/genreMode は依存に入れない (推定結果の setState で無限ループするのを防ぐ)。
+  useEffect(() => {
+    if (!(searchMode === "semantic" && submittedQuery)) return;
+    setLoading(true);
+    setError(null);
+    const override = genreOverrideRef.current;
+    semanticSearch(submittedQuery, {
+      offset: 0,
+      limit: PAGE_SIZE,
+      ...(override ? { genres: selectedGenres, genreMode } : {}),
+    })
+      .then((r) => {
+        setSeries(r.data.series);
+        setTotal(r.data.total);
+        setHasMore(Boolean(r.data.has_more));
+        if (!override) {
+          setSelectedGenres(r.data.genres);
+          setGenreMode(r.data.genre_mode);
+        }
+      })
+      .catch((e) => setError(String(e?.message ?? e)))
+      .finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [submittedQuery, searchMode, semanticTick]);
+
+  // ジャンル/AND-OR のユーザー編集 → 上書きモードで semantic を再検索
+  const editGenres = (next: string[]) => {
+    setSelectedGenres(next);
+    if (searchMode === "semantic" && submittedQuery) {
+      genreOverrideRef.current = true;
+      setSemanticTick((t) => t + 1);
+    }
+  };
+  const changeGenreMode = (m: "and" | "or") => {
+    setGenreMode(m);
+    if (searchMode === "semantic" && submittedQuery) {
+      genreOverrideRef.current = true;
+      setSemanticTick((t) => t + 1);
+    }
+  };
+
+  // 「さらに見る」: 現在の絞り込み(選択中タグ+モード)で続きを取得して追記
   const loadMore = () => {
     if (loadingMore || !isSemantic) return;
     setLoadingMore(true);
-    semanticSearch(submittedQuery, { genres: selectedGenres, offset: series.length, limit: PAGE_SIZE })
+    semanticSearch(submittedQuery, {
+      genres: selectedGenres,
+      genreMode,
+      offset: series.length,
+      limit: PAGE_SIZE,
+    })
       .then((r) => {
         setSeries((prev) => [...prev, ...r.data.series]);
         setHasMore(Boolean(r.data.has_more));
@@ -148,10 +203,13 @@ export default function SearchPage() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    genreOverrideRef.current = false;  // 新規検索は AI 推定から
     setSubmittedQuery(keyword.trim());
   };
 
   const clearAll = () => {
+    genreOverrideRef.current = false;
+    setGenreMode("or");
     setKeyword("");
     setSubmittedQuery("");
     setSelectedGenres([]);
@@ -185,7 +243,10 @@ export default function SearchPage() {
         ] as const).map((m) => (
           <button
             key={m.v}
-            onClick={() => setSearchMode(m.v)}
+            onClick={() => {
+              genreOverrideRef.current = false;
+              setSearchMode(m.v);
+            }}
             className={`px-4 py-1.5 rounded-full font-rounded font-bold text-sm transition ${
               searchMode === m.v
                 ? "bg-white text-primary-600 shadow-soft"
@@ -222,13 +283,41 @@ export default function SearchPage() {
       <div className="mt-8 grid grid-cols-1 lg:grid-cols-[260px,1fr] gap-8">
         {/* フィルタ */}
         <aside className="space-y-6">
-          <FilterGroup
-            label="ジャンル"
-            options={tags.genre_tags}
-            selected={selectedGenres}
-            onToggle={(v) => setSelectedGenres((cur) => toggle(cur, v))}
-            chipColor="chip-blue"
-          />
+          <div>
+            <FilterGroup
+              label="ジャンル"
+              options={tags.genre_tags}
+              selected={selectedGenres}
+              onToggle={(v) => editGenres(toggle(selectedGenres, v))}
+              chipColor="chip-blue"
+            />
+            {isSemantic && (
+              <div className="mt-3">
+                <p className="text-xs text-ink-muted font-rounded mb-1.5">
+                  🪄 AIがクエリから推定したジャンルを自動選択。チップで調整できます。
+                </p>
+                <div className="inline-flex rounded-full bg-cream-100 p-1 gap-1">
+                  {([
+                    { v: "and", label: "すべて含む (AND)" },
+                    { v: "or", label: "いずれか (OR)" },
+                  ] as const).map((m) => (
+                    <button
+                      key={m.v}
+                      onClick={() => changeGenreMode(m.v)}
+                      disabled={!selectedGenres.length}
+                      className={`px-3 py-1 rounded-full font-rounded font-bold text-xs transition disabled:opacity-40 ${
+                        genreMode === m.v
+                          ? "bg-white text-primary-600 shadow-soft"
+                          : "text-ink-muted hover:text-ink"
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
           <FilterGroup
             label="雰囲気"
             options={tags.atmosphere_tags}

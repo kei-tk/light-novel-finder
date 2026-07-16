@@ -276,16 +276,23 @@ def _index_of(series_id: str) -> int | None:
         return None
 
 
-def _genre_mask(genres: list[str] | None, required: set[str] | None) -> np.ndarray | None:
-    """ジャンル絞り込み用の bool マスク (None なら絞り込みなし)。"""
+def _genre_mask(genres: list[str] | None, required: set[str] | None,
+                genre_mode: str = "or") -> np.ndarray | None:
+    """ジャンル絞り込み用の bool マスク (None なら絞り込みなし)。
+    genre_mode: "and"=指定タグを全て持つ / "or"=いずれかを持つ。
+    required は similar() 用の別条件 (常に OR)。"""
     if not genres and not required:
         return None
     gset = set(genres) if genres else None
     mask = np.zeros(len(_ids), dtype=bool)
     for i in range(len(_ids)):
         tags = _genre_sets[i]
-        if gset is not None and not (gset & tags):
-            continue
+        if gset is not None:
+            if genre_mode == "and":
+                if not gset.issubset(tags):
+                    continue
+            elif not (gset & tags):
+                continue
         if required is not None and not (required & tags):
             continue
         mask[i] = True
@@ -308,19 +315,13 @@ def _topk_from_scores(scores: np.ndarray, limit: int, exclude: set[str],
     return out
 
 
-def _scores_by_split(query: str) -> np.ndarray | None:
-    """クエリを6観点サブクエリに分割 (gpt-5.5) し、各サブクエリを embedding して対応 facet と
-    照合した合算スコアを返す。分割失敗時は None (重み方式へフォールバック)。"""
-    from app.services import query_splitter
-    subs = query_splitter.split(query)
-    if not subs:
-        return None
-    active = [(f, t) for f, t in subs.items() if t]
-    if not active:
+def _scores_from_facets(facets: dict) -> np.ndarray | None:
+    """6観点サブクエリ (facet→サブクエリ文) を embedding し、対応 facet と照合した
+    合算スコアを返す。有効サブクエリが無ければ None。"""
+    active = [(f, t) for f, t in facets.items() if t]
+    if not active or not _openai:
         return None
     # 各サブクエリをまとめて 1回で embedding
-    if not _openai:
-        return None
     resp = _openai.embeddings.create(model=settings.openai_aspect_embedding_model,
                                      input=[t for _, t in active])
     scores = np.zeros(len(_ids), dtype=np.float32)
@@ -346,19 +347,40 @@ def _scores_by_weight(query: str) -> np.ndarray | None:
 
 
 def semantic(query: str,
-             genres: list[str] | None = None) -> list[tuple[str, float]]:
-    """自然言語クエリ検索。クエリを6観点サブクエリに分割して各 facet に照合する
-    (失敗時は facet 重み方式へフォールバック)。件数で区切らず関連度順で全件返し、
-    表示は API/フロントの offset/limit で『さらに見る』式に小出しにする。"""
+             genres: list[str] | None = None,
+             genre_mode: str | None = None) -> tuple[list[tuple[str, float]], list[str], str]:
+    """自然言語クエリ検索。クエリを6観点サブクエリに分割して各 facet に照合し
+    (失敗時は facet 重み方式へフォールバック)、AIが推定したジャンルタグで絞り込む。
+
+    genres: None なら AI 推定のジャンルタグを使う。リスト (空含む) を渡すとそれで上書き
+            (ユーザーが UI で選択/解除した状態)。
+    genre_mode: None なら AI 推定の "and"/"or"。指定でその方式に上書き。
+
+    戻り値: (関連度順の (series_id, score) 全件, 適用したジャンルタグ, 適用した genre_mode)。
+    件数で区切らず、表示は API/フロントの offset/limit で『さらに見る』式に小出しにする。
+    """
     _load()
     if not _mats or _mats[FACETS[0]].shape[0] == 0:
-        return []
-    scores = _scores_by_split(query)
+        return [], [], "or"
+
+    from app.services import query_splitter
+    split = query_splitter.split(query)
+    inferred_genres: list[str] = []
+    inferred_mode = "or"
+    scores = None
+    if split:
+        scores = _scores_from_facets(split["facets"])
+        inferred_genres = split.get("genres") or []
+        inferred_mode = split.get("genre_mode") or "or"
     if scores is None:
         scores = _scores_by_weight(query)
     if scores is None:
-        return []
-    mask = _genre_mask(genres, None)
+        return [], [], "or"
+
+    # ユーザー指定 (genres/genre_mode) があればそれを、無ければ AI 推定を使う
+    applied_genres = list(genres) if genres is not None else inferred_genres
+    applied_mode = genre_mode if genre_mode in ("and", "or") else inferred_mode
+    mask = _genre_mask(applied_genres, None, genre_mode=applied_mode)
 
     order = np.argsort(-scores)
     out: list[tuple[str, float]] = []
@@ -366,7 +388,7 @@ def semantic(query: str,
         if mask is not None and not mask[idx]:
             continue
         out.append((_ids[idx], float(scores[idx])))
-    return out
+    return out, applied_genres, applied_mode
 
 
 # ============================ similar ============================

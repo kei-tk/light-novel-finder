@@ -26,8 +26,11 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --d
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
 sudo apt update
 
-# 依存パッケージ (python=API, node=フロントのビルド, caddy=自動HTTPS)
-sudo apt install -y python3.12 python3.12-venv git nodejs npm caddy
+# Node は Vite 7 のビルドに 20+ が必要。Ubuntu 標準(18)では不足するので NodeSource で 22 を入れる
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+
+# 依存パッケージ (python=API, nodejs=フロントのビルド(npm同梱), caddy=自動HTTPS)
+sudo apt install -y python3.12 python3.12-venv git nodejs caddy
 sudo mkdir -p /opt/ranobe && sudo chown ranobe:ranobe /opt/ranobe
 ```
 

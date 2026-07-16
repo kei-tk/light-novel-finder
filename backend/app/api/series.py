@@ -260,17 +260,21 @@ def _fetch_series_ordered(ids: list[str]) -> list[dict]:
 @router.get("/semantic")
 def semantic_search(
     q: str = Query(..., min_length=1, description="自然言語クエリ"),
-    genre: str | None = Query(None, description="ジャンル絞り込み (カンマ区切りで OR)"),
+    genre: str | None = Query(None, description="ジャンル絞り込み。未指定=AI推定, 空文字=絞り込みなし, カンマ区切り=そのタグ"),
+    genre_mode: str | None = Query(None, description="and / or。未指定なら AI 推定"),
     limit: int = Query(48, le=120, description="1ページの件数"),
     offset: int = Query(0, ge=0, description="さらに見る用オフセット"),
 ):
     """自然言語クエリでのハイブリッド類似検索 (6観点ベクトル + ジャンル絞り込み)。
+    ジャンルタグと AND/OR は AI が推定するが、genre / genre_mode で上書きできる。
     候補を関連度順に並べ、offset/limit で『さらに見る』式に返す。件数では区切らない。
-    total は候補総数 (まだ続きがあるか判定用)。
+    応答の genres / genre_mode は「実際に適用した」値 (フロントのチップ表示・トグル用)。
     """
     from app.services import vector_search
-    genres = [g.strip() for g in genre.split(",") if g.strip()] if genre else None
-    hits = vector_search.semantic(q, genres=genres)
+    # genre 未指定(None)=AI推定 / 空文字=絞り込み無し([]) / カンマ区切り=そのタグ
+    genres = None if genre is None else [g.strip() for g in genre.split(",") if g.strip()]
+    hits, applied_genres, applied_mode = vector_search.semantic(
+        q, genres=genres, genre_mode=genre_mode)
     total = len(hits)
     page = hits[offset:offset + limit]
     return {
@@ -279,6 +283,8 @@ def semantic_search(
         "total": total,
         "offset": offset,
         "has_more": offset + len(page) < total,
+        "genres": applied_genres,
+        "genre_mode": applied_mode,
     }
 
 

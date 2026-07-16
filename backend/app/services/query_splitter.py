@@ -16,16 +16,25 @@ from app.config import settings
 FACETS = ["plot", "cast", "theme", "mood", "reader", "review"]
 SPLIT_MODEL = "gpt-5.5"
 
+# DB に存在するジャンルタグ (24種の固定集合)。LLM にはこの中からのみ選ばせる。
+VALID_GENRES = [
+    "ファンタジー", "恋愛", "学園", "ラブコメ", "バトル", "アクション", "青春", "冒険",
+    "ゲーム", "SF", "ギャグ", "日常系", "ミステリー", "RPG", "エロコメディ", "グルメ",
+    "歴史", "メカ", "百合", "探偵", "ホラー", "BL", "音楽", "ビジネス",
+]
+_VALID_GENRE_SET = set(VALID_GENRES)
+
 # gpt-5.5 が実データ300件を精読して生成した分割プロンプト (キャッシュ対象の固定 prefix)
 SPLIT_SYSTEM_PROMPT = """あなたはライトノベル推薦DBのためのクエリ分割器です。
 ユーザーの自然言語検索クエリを、6つの観点 plot / cast / theme / mood / reader / review に分解し、JSONのみを出力してください。
 
 # 出力形式
 必ず次のキーを持つJSONオブジェクトだけを出力する。
-{"plot":..., "cast":..., "theme":..., "mood":..., "reader":..., "review":...}
+{"plot":..., "cast":..., "theme":..., "mood":..., "reader":..., "review":..., "genres":[...], "genre_mode":"and"|"or"}
 
-各値は、日本語の短いサブクエリ文、または null とする。
+plot〜review の各値は、日本語の短いサブクエリ文、または null とする。
 クエリで触れられていない観点は必ず null にする。無理に補完しない。
+genres は該当ジャンルタグの配列 (該当なしは [])、genre_mode は "and" か "or"。
 説明文、Markdown、前置き、後書きは出力しない。
 
 # 各観点の意味
@@ -83,21 +92,39 @@ SPLIT_SYSTEM_PROMPT = """あなたはライトノベル推薦DBのためのク�
 12. 固有名詞が含まれる場合は、そのまま必要な観点に含めてよい。
 13. 出力値は長くしすぎない。原則として1観点あたり20〜40字程度の短い日本語にする。
 
+# ジャンルタグの抽出 (genres / genre_mode)
+6観点とは別に、クエリに該当する「ジャンルタグ」を次の固定24リストからすべて選び genres 配列に入れる。
+該当が無ければ [] とする。この24個以外は絶対に出力しない。
+  ファンタジー, 恋愛, 学園, ラブコメ, バトル, アクション, 青春, 冒険, ゲーム, SF, ギャグ,
+  日常系, ミステリー, RPG, エロコメディ, グルメ, 歴史, メカ, 百合, 探偵, ホラー, BL, 音楽, ビジネス
+
+- 言い換え・上位概念を吸収する。例: 女の子同士の恋愛/GL→「百合」, 男同士/ボーイズラブ→「BL」,
+  異世界/剣と魔法/魔法→「ファンタジー」, 飯テロ/料理/グルメ描写→「グルメ」, 推理/事件解決→「ミステリー」,
+  笑える/コメディ→「ギャグ」または「ラブコメ」, まったり/スローライフ→「日常系」。
+- クエリに明示または強く含意されるものだけ。雰囲気や展開の細部から無理にジャンルを増やさない。
+
+genre_mode は "and" か "or":
+- "and": 複数ジャンルの組合せを明確に求めている(全て満たすべき)。例「百合の学園もの」→ 全部持つ作品。
+- "or": ジャンルが選択肢的/広め、または該当が1つだけ。例「バトルかアクション」。
+- 迷う場合や1つだけの場合は "or" にする(絞りすぎて0件になるのを避ける)。
+
 # 例
 入力: 主人公最強で無双する爽快バトル
-出力: {"plot":"戦闘・バトル中心の展開","cast":"圧倒的に強い主人公","theme":null,"mood":"爽快感のあるバトル","reader":null,"review":null}
+出力: {"plot":"戦闘・バトル中心の展開","cast":"圧倒的に強い主人公","theme":null,"mood":"爽快感のあるバトル","reader":null,"review":null,"genres":["バトル","アクション"],"genre_mode":"or"}
 入力: 疲れた時に読む、料理が美味しそうな異世界スローライフ
-出力: {"plot":"異世界で料理や日常を楽しむスローライフ","cast":null,"theme":null,"mood":"料理描写が美味しそうな癒し系","reader":"疲れた時に癒されたい読者向け","review":null}
+出力: {"plot":"異世界で料理や日常を楽しむスローライフ","cast":null,"theme":null,"mood":"料理描写が美味しそうな癒し系","reader":"疲れた時に癒されたい読者向け","review":null,"genres":["ファンタジー","グルメ","日常系"],"genre_mode":"and"}
 入力: ヤンデレヒロインとの重い恋愛が読みたい
-出力: {"plot":null,"cast":"ヤンデレヒロインとの恋愛関係","theme":"重い愛情や共依存の恋愛","mood":"重く切ない恋愛ムード","reader":"重い恋愛ものを読みたい人向け","review":null}
-入力: 百合バディが怪事件を解決するダークなミステリー
-出力: {"plot":"怪事件を解決するミステリー展開","cast":"百合寄りのバディ関係","theme":null,"mood":"ダークで緊張感のある雰囲気","reader":null,"review":null}"""
+出力: {"plot":null,"cast":"ヤンデレヒロインとの恋愛関係","theme":"重い愛情や共依存の恋愛","mood":"重く切ない恋愛ムード","reader":"重い恋愛ものを読みたい人向け","review":null,"genres":["恋愛"],"genre_mode":"or"}
+入力: 百合の学園もので怪事件を解決するダークなミステリー
+出力: {"plot":"怪事件を解決するミステリー展開","cast":"百合寄りの関係","theme":null,"mood":"ダークで緊張感のある雰囲気","reader":null,"review":null,"genres":["百合","学園","ミステリー"],"genre_mode":"and"}"""
 
 _openai = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
 
 
-def split(query: str) -> dict[str, str | None] | None:
-    """クエリを6観点サブクエリに分割。失敗時 None。
+def split(query: str) -> dict | None:
+    """クエリを6観点サブクエリ + 該当ジャンルタグ + AND/OR に分割。失敗時 None。
+    戻り値: {"facets": {6観点: サブクエリ or None},
+             "genres": [該当ジャンルタグ], "genre_mode": "and"|"or"}
     system プロンプトは固定なので OpenAI プロンプトキャッシングが効く。"""
     if not _openai:
         return None
@@ -113,15 +140,25 @@ def split(query: str) -> dict[str, str | None] | None:
         data = json.loads(resp.choices[0].message.content)
     except Exception:
         return None
-    out: dict[str, str | None] = {}
+    facets: dict[str, str | None] = {}
     for f in FACETS:
         v = data.get(f)
-        out[f] = v.strip() if isinstance(v, str) and v.strip() else None
+        facets[f] = v.strip() if isinstance(v, str) and v.strip() else None
     # 全 null は失敗扱い (フォールバックさせる)
-    if not any(out.values()):
+    if not any(facets.values()):
         print(f"[query_split] {query!r} → 全 null (重み方式へフォールバック)")
         return None
+    # ジャンルタグ: 24種の妥当なものだけ採用 (重複除去・順序維持)
+    raw_genres = data.get("genres") or []
+    genres: list[str] = []
+    if isinstance(raw_genres, list):
+        for g in raw_genres:
+            if isinstance(g, str) and g in _VALID_GENRE_SET and g not in genres:
+                genres.append(g)
+    mode = data.get("genre_mode")
+    genre_mode = mode if mode in ("and", "or") else "or"
+
     cached = getattr(getattr(resp.usage, "prompt_tokens_details", None), "cached_tokens", 0)
-    active = {f: t for f, t in out.items() if t}
-    print(f"[query_split] {query!r} → {active}  (cached_tokens={cached})")
-    return out
+    active = {f: t for f, t in facets.items() if t}
+    print(f"[query_split] {query!r} → {active} genres={genres}({genre_mode})  (cached_tokens={cached})")
+    return {"facets": facets, "genres": genres, "genre_mode": genre_mode}

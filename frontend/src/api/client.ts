@@ -154,7 +154,13 @@ export const fetchSeriesDetail = (id: string) =>
 // 関連度しきい値以上をランク順に返す。offset/limit で「さらに見る」式に取得する。
 export const semanticSearch = (
   q: string,
-  opts?: { genres?: string[]; offset?: number; limit?: number; minRatio?: number }
+  opts?: {
+    offset?: number;
+    limit?: number;
+    // genres 未指定=AI推定 / [] =絞り込みなし / [..] =そのタグで上書き
+    genres?: string[];
+    genreMode?: "and" | "or";
+  }
 ) =>
   apiClient.get<{
     query: string;
@@ -162,13 +168,15 @@ export const semanticSearch = (
     total: number;
     offset: number;
     has_more: boolean;
+    genres: string[];
+    genre_mode: "and" | "or";
   }>("/series/semantic", {
     params: {
       q,
       ...(opts?.offset != null ? { offset: opts.offset } : {}),
       ...(opts?.limit != null ? { limit: opts.limit } : {}),
-      ...(opts?.minRatio != null ? { min_ratio: opts.minRatio } : {}),
-      ...(opts?.genres && opts.genres.length ? { genre: opts.genres.join(",") } : {}),
+      ...(opts?.genres != null ? { genre: opts.genres.join(",") } : {}),
+      ...(opts?.genreMode ? { genre_mode: opts.genreMode } : {}),
     },
   });
 
