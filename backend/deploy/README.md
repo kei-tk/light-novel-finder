@@ -16,9 +16,18 @@
 ## 1. サーバ初期設定
 
 ```bash
-sudo adduser --disabled-password --gecos "" ranobe        # 実行用ユーザー
+# 実行用ユーザー
+sudo adduser --disabled-password --gecos "" ranobe
+
+# Caddy は Ubuntu 標準リポジトリに無いので公式リポジトリを追加してから入れる
 sudo apt update
-sudo apt install -y python3.12 python3.12-venv git caddy nodejs npm  # Caddy=自動HTTPS, node=フロントのビルド用
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update
+
+# 依存パッケージ (python=API, node=フロントのビルド, caddy=自動HTTPS)
+sudo apt install -y python3.12 python3.12-venv git nodejs npm caddy
 sudo mkdir -p /opt/ranobe && sudo chown ranobe:ranobe /opt/ranobe
 ```
 
