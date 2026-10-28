@@ -1,0 +1,14 @@
+.git
+.codex
+.agents
+**/.env
+**/.env.*
+backend/venv
+backend/backups
+backend/cache
+backend/data
+backend/migrations
+backend/scripts
+design
+frontend/node_modules
+frontend/dist

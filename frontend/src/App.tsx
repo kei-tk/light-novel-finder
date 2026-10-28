@@ -35,9 +35,10 @@ export default function App() {
   );
 }
 
+// ログイン必須ルートのラッパ。判定中はローダー、未ログインは /auth へ飛ばす
 function RequireAuth({ children }: { children: React.ReactElement }) {
   const { user, loading } = useAuth();
-  if (loading) return <FullScreenLoader />;
+  if (loading) return <FullScreenLoader />;  // セッション確認中
   if (!user) return <Navigate to="/auth" replace />;
   return children;
 }

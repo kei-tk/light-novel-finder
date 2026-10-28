@@ -78,3 +78,5 @@ log2.txt
 skip_log.txt
 backend/skip_log.txt
 *.log
+.vercel
+.env*

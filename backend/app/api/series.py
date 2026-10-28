@@ -1,6 +1,7 @@
 """シリーズ関連 API (新スキーマ openbd_test_series/books 対応)。"""
 
 import datetime
+import os
 import random
 
 from fastapi import APIRouter, HTTPException, Query
@@ -244,7 +245,13 @@ def search(
     }
 
 
-# ----------------- ベクトル検索 (類似 / 自然言語 / おすすめ) -----------------
+@router.get("/semantic", include_in_schema=False)
+def semantic_search_gone():
+    """削除済みのAI意味検索URLをシリーズ詳細として誤処理しない。"""
+    raise HTTPException(status_code=410, detail="AI意味検索は提供を終了しました")
+
+
+# ----------------- ベクトル検索 (類似 / おすすめ) -----------------
 
 def _fetch_series_ordered(ids: list[str]) -> list[dict]:
     """series_id のリストを順序維持で取得し、最新カバーを付与。"""
@@ -257,40 +264,12 @@ def _fetch_series_ordered(ids: list[str]) -> list[dict]:
     return _attach_latest_covers(ordered)
 
 
-@router.get("/semantic")
-def semantic_search(
-    q: str = Query(..., min_length=1, description="自然言語クエリ"),
-    genre: str | None = Query(None, description="ジャンル絞り込み。未指定=AI推定, 空文字=絞り込みなし, カンマ区切り=そのタグ"),
-    genre_mode: str | None = Query(None, description="and / or。未指定なら AI 推定"),
-    limit: int = Query(48, le=120, description="1ページの件数"),
-    offset: int = Query(0, ge=0, description="さらに見る用オフセット"),
-):
-    """自然言語クエリでのハイブリッド類似検索 (6観点ベクトル + ジャンル絞り込み)。
-    ジャンルタグと AND/OR は AI が推定するが、genre / genre_mode で上書きできる。
-    候補を関連度順に並べ、offset/limit で『さらに見る』式に返す。件数では区切らない。
-    応答の genres / genre_mode は「実際に適用した」値 (フロントのチップ表示・トグル用)。
-    """
-    from app.services import vector_search
-    # genre 未指定(None)=AI推定 / 空文字=絞り込み無し([]) / カンマ区切り=そのタグ
-    genres = None if genre is None else [g.strip() for g in genre.split(",") if g.strip()]
-    hits, applied_genres, applied_mode = vector_search.semantic(
-        q, genres=genres, genre_mode=genre_mode)
-    total = len(hits)
-    page = hits[offset:offset + limit]
-    return {
-        "query": q,
-        "series": _fetch_series_ordered([sid for sid, _ in page]),
-        "total": total,
-        "offset": offset,
-        "has_more": offset + len(page) < total,
-        "genres": applied_genres,
-        "genre_mode": applied_mode,
-    }
-
-
 @router.get("/{series_id}/similar")
 def similar_series(series_id: str, limit: int = Query(12, le=40)):
     """この series に似ているシリーズ (埋め込みベクトル近傍)。"""
+    # Vercel には約600MBのベクトルキャッシュを載せないため、VPS/ローカルだけで提供する。
+    if os.getenv("VERCEL"):
+        return {"series": []}
     from app.services import vector_search
     hits = vector_search.similar(series_id, limit)
     return {"series": _fetch_series_ordered([sid for sid, _ in hits])}

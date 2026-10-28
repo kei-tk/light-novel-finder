@@ -7,6 +7,7 @@ interface Props {
   badge?: { label: string; color?: "pink" | "blue" | "yellow" | "mint" };
 }
 
+// バッジ色 → Tailwind クラスの対応表
 const badgeClass = {
   pink: "bg-primary-500 text-white",
   blue: "bg-accent-500 text-white",
@@ -14,10 +15,11 @@ const badgeClass = {
   mint: "bg-mint-500 text-white",
 } as const;
 
+// 一覧・グリッドで使う作品カード。クリックでシリーズ詳細へ遷移
 export default function SeriesCard({ series, badge }: Props) {
   const navigate = useNavigate();
-  const tags = (series.genre_tags ?? []).slice(0, 2);
-  const atmospheres = (series.atmosphere_tags ?? []).slice(0, 1);
+  const tags = (series.genre_tags ?? []).slice(0, 2);          // ジャンルは先頭2件だけ表示
+  const atmospheres = (series.atmosphere_tags ?? []).slice(0, 1); // 雰囲気は先頭1件だけ表示
   return (
     <Link
       to={`/series/${series.id}`}
@@ -63,6 +65,7 @@ export default function SeriesCard({ series, badge }: Props) {
             <span
               role="link"
               tabIndex={0}
+              // カード全体が詳細へのLinkなので、著者名クリックは伝播を止めて著者ページへ分岐させる
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();

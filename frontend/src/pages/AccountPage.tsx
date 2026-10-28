@@ -11,6 +11,7 @@ import {
 import { useAuth } from "../contexts/AuthContext";
 import SeriesCard from "../components/SeriesCard";
 
+// マイページの3タブ: プロフィール / お気に入り / 読了済み
 type Tab = "profile" | "favorites" | "read";
 
 export default function AccountPage() {
@@ -115,6 +116,7 @@ function ProfileTab() {
     }
   };
 
+  // 好みタグのON/OFF。kind でジャンル/雰囲気のどちらの配列を更新するか切り替える
   const toggleTag = (kind: "favorite_genres" | "favorite_atmospheres", tag: string) => {
     setProfile((p) => {
       if (!p) return p;

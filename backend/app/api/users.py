@@ -4,6 +4,8 @@
 supabase-py の auth.get_user(token) で検証する。
 """
 
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, Field
 
@@ -100,7 +102,6 @@ def remove_favorite(series_id: str, user_id: str = Depends(get_current_user)):
 @router.get("/me/recommendations")
 def my_recommendations(user_id: str = Depends(get_current_user), limit: int = 12):
     """お気に入り＋読了済みの埋め込みの重心に近い series を推薦 (ベクトルおすすめ)。"""
-    from app.services import vector_search
     sb = get_supabase()
     fav = sb.table("favorite_series").select("series_id") \
         .eq("user_id", user_id).order("created_at", desc=True).limit(50).execute().data or []
@@ -109,6 +110,10 @@ def my_recommendations(user_id: str = Depends(get_current_user), limit: int = 12
     source_ids = list({r["series_id"] for r in fav + read})
     if not source_ids:
         return {"series": [], "based_on": 0}
+    # Vercel には約600MBのベクトルキャッシュを載せないため、VPS/ローカルだけで提供する。
+    if os.getenv("VERCEL"):
+        return {"series": [], "based_on": len(source_ids)}
+    from app.services import vector_search
     hits = vector_search.recommend(source_ids, limit)
     return {
         "series": _fetch_series_ordered([sid for sid, _ in hits]),

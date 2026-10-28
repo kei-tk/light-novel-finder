@@ -1,0 +1,21 @@
+[project]
+name = "light-novel-finder"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "fastapi==0.142.4",
+  "httpx==0.28.1",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.14.2",
+  "python-dotenv==1.0.1",
+  "supabase==2.31.0",
+]
+
+[tool.vercel]
+entrypoint = "main:app"
+
+[tool.vercel.scripts]
+build = "cd frontend && npm ci && npm run build"
+
+[tool.vercel.fastapi.static]
+exclude = true

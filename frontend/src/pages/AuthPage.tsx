@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link, Navigate, useNavigate } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 
-type Mode = "signin" | "signup";
+type Mode = "signin" | "signup";  // ログイン / 新規登録 の切り替え
 
 export default function AuthPage() {
   const { user, signIn, signUp } = useAuth();
@@ -10,13 +10,14 @@ export default function AuthPage() {
   const [mode, setMode] = useState<Mode>("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [displayName, setDisplayName] = useState("");  // 新規登録時の表示名(任意)
+  const [busy, setBusy] = useState(false);              // 送信中(二重送信防止)
   const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null); // 「確認メール送信」等の案内
 
-  if (user) return <Navigate to="/account" replace />;
+  if (user) return <Navigate to="/account" replace />;  // ログイン済みならマイページへ
 
+  // 送信: ログインは成功で/accountへ、新規登録はメール確認を促す
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);

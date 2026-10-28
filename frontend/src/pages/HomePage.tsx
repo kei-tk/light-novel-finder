@@ -12,13 +12,14 @@ import { useAuth } from "../contexts/AuthContext";
 
 export default function HomePage() {
   const { user } = useAuth();
-  const [recommended, setRecommended] = useState<Series[]>([]);
-  const [newReleases, setNewReleases] = useState<Series[]>([]);
-  const [trending, setTrending] = useState<Series[]>([]);
-  const [forYou, setForYou] = useState<Series[]>([]);
+  const [recommended, setRecommended] = useState<Series[]>([]); // おすすめの定番
+  const [newReleases, setNewReleases] = useState<Series[]>([]); // 新作・新刊
+  const [trending, setTrending] = useState<Series[]>([]);       // 話題沸騰中
+  const [forYou, setForYou] = useState<Series[]>([]);           // あなたへのおすすめ(ログイン時のみ)
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // 全員向けの3セクションを並行取得
   useEffect(() => {
     Promise.all([
       fetchRecommended(12),
@@ -34,10 +35,10 @@ export default function HomePage() {
       .finally(() => setLoading(false));
   }, []);
 
-  // ログインユーザーには、お気に入り/読了からのベクトルおすすめを取得
+  // ログインユーザーのみ、お気に入り/読了の嗜好に基づくベクトルおすすめを取得
   useEffect(() => {
     if (!user) {
-      setForYou([]);
+      setForYou([]);  // ログアウト時はクリア
       return;
     }
     fetchRecommendations(12)

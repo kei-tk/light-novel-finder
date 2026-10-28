@@ -1,8 +1,10 @@
 import axios from "axios";
 import { supabase } from "../lib/supabase";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+// 公開環境は同一ドメインの /api、ローカル開発は frontend/.env で上書きする
+const API_BASE = import.meta.env.VITE_API_URL || "/api";
 
+// 全API呼び出しで共有する axios インスタンス
 export const apiClient = axios.create({
   baseURL: API_BASE,
   headers: { "Content-Type": "application/json" },
@@ -20,6 +22,7 @@ apiClient.interceptors.request.use(async (config) => {
 
 // ---------- 型定義 ----------
 
+// シリーズ1件分。一覧・検索・詳細すべてで使う基本型
 export interface Series {
   id: string;
   series_title: string;
@@ -55,6 +58,7 @@ export interface Series {
   review_aspect_text: string | null;
 }
 
+// 書籍(巻)1冊分。シリーズ詳細ページの巻一覧で使う
 export interface Book {
   isbn: string;
   title: string;
@@ -68,6 +72,7 @@ export interface Book {
   description: string | null;
 }
 
+// 派生シリーズ(スピンオフ等)。親シリーズ詳細に紐づく
 export interface SubSeries {
   id: string;
   series_title: string;
@@ -76,11 +81,13 @@ export interface SubSeries {
   latest_published_date: string | null;
 }
 
+// シリーズ詳細 = 基本情報 + 巻一覧 + 派生シリーズ
 export interface SeriesDetail extends Series {
   books: Book[];
   sub_series: SubSeries[];
 }
 
+// ログインユーザーのプロフィール
 export interface Profile {
   id: string;
   display_name: string | null;
@@ -89,6 +96,7 @@ export interface Profile {
   favorite_atmospheres: string[] | null;
 }
 
+// ある作品に対する自分の状態(お気に入り/読了/評価)。詳細ページのボタン表示用
 export interface SeriesStatus {
   is_favorite: boolean;
   is_read: boolean;
@@ -149,36 +157,7 @@ export const fetchTags = () =>
 export const fetchSeriesDetail = (id: string) =>
   apiClient.get<SeriesDetail>(`/series/${id}`);
 
-// ---------- ベクトル検索 (類似 / 自然言語 / おすすめ) ----------
-
-// 関連度しきい値以上をランク順に返す。offset/limit で「さらに見る」式に取得する。
-export const semanticSearch = (
-  q: string,
-  opts?: {
-    offset?: number;
-    limit?: number;
-    // genres 未指定=AI推定 / [] =絞り込みなし / [..] =そのタグで上書き
-    genres?: string[];
-    genreMode?: "and" | "or";
-  }
-) =>
-  apiClient.get<{
-    query: string;
-    series: Series[];
-    total: number;
-    offset: number;
-    has_more: boolean;
-    genres: string[];
-    genre_mode: "and" | "or";
-  }>("/series/semantic", {
-    params: {
-      q,
-      ...(opts?.offset != null ? { offset: opts.offset } : {}),
-      ...(opts?.limit != null ? { limit: opts.limit } : {}),
-      ...(opts?.genres != null ? { genre: opts.genres.join(",") } : {}),
-      ...(opts?.genreMode ? { genre_mode: opts.genreMode } : {}),
-    },
-  });
+// ---------- ベクトル検索 (類似 / おすすめ) ----------
 
 export const fetchSimilarSeries = (id: string, limit = 12) =>
   apiClient.get<{ series: Series[] }>(`/series/${id}/similar`, { params: { limit } });

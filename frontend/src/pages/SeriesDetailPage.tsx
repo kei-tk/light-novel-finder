@@ -15,6 +15,7 @@ import {
 import SeriesCard from "../components/SeriesCard";
 import { useAuth } from "../contexts/AuthContext";
 
+// 6軸の雰囲気スコアを棒グラフ表示するためのメタ情報 (キー=DBカラム名)
 const SCORE_AXES = [
   { key: "comedy_score",       emoji: "😆", label: "コメディ",  color: "bg-sunny-500" },
   { key: "serious_score",      emoji: "😤", label: "シリアス",  color: "bg-ink" },
@@ -29,11 +30,12 @@ export default function SeriesDetailPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
 
-  const [detail, setDetail] = useState<SeriesDetail | null>(null);
-  const [status, setStatus] = useState<SeriesStatus | null>(null);
+  const [detail, setDetail] = useState<SeriesDetail | null>(null);  // シリーズ詳細(巻・派生含む)
+  const [status, setStatus] = useState<SeriesStatus | null>(null);  // 自分のお気に入り/読了状態
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // シリーズ詳細を取得 (id が変わるたび)
   useEffect(() => {
     if (!id) return;
     setLoading(true);
@@ -43,6 +45,7 @@ export default function SeriesDetailPage() {
       .finally(() => setLoading(false));
   }, [id]);
 
+  // ログイン中のみ、この作品への自分の状態(お気に入り/読了)を取得
   useEffect(() => {
     if (!id || !user) {
       setStatus(null);
@@ -51,6 +54,7 @@ export default function SeriesDetailPage() {
     fetchSeriesStatus(id).then((r) => setStatus(r.data)).catch(() => {});
   }, [id, user]);
 
+  // お気に入りON/OFF。未ログインならログイン画面へ誘導。成功後は手元の status も即反映
   const toggleFavorite = async () => {
     if (!user) {
       navigate("/auth");
@@ -66,6 +70,7 @@ export default function SeriesDetailPage() {
     }
   };
 
+  // 読了ON/OFF。解除時は評価(rating)もクリアする
   const toggleRead = async () => {
     if (!user) {
       navigate("/auth");
@@ -292,6 +297,7 @@ const ASPECTS: { key: keyof Series; emoji: string; label: string }[] = [
   { key: "review_aspect_text", emoji: "🗣", label: "読者の評価" },
 ];
 
+// 6観点(筋/人物/主題/雰囲気/読者/評判)の説明テキストをカード表示。中身が空の観点は出さない
 function AspectSection({ detail }: { detail: Series }) {
   const items = ASPECTS.filter((a) => {
     const v = detail[a.key];
@@ -319,6 +325,7 @@ function AspectSection({ detail }: { detail: Series }) {
   );
 }
 
+// この作品に似たシリーズをベクトル近傍から取得して並べる
 function SimilarSection({ seriesId }: { seriesId: string }) {
   const [series, setSeries] = useState<Series[]>([]);
   const [loading, setLoading] = useState(true);

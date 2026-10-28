@@ -36,7 +36,7 @@ app.include_router(series_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 
 
-@app.get("/")
+@app.get("/api")
 def root():
     return {"message": "Ranobe Finder API v2"}
 
