@@ -3,12 +3,12 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # X API
-    x_bearer_token: str
+    x_bearer_token: str = ""
     x_api_key: str = ""
     x_api_secret: str = ""
 
     # Gemini
-    gemini_api_key: str
+    gemini_api_key: str = ""
     gemini_analysis_model: str = "gemini-2.5-pro"    # ツイート判定用
     gemini_enrichment_model: str = "gemini-3.1-pro-preview"  # あらすじ・タグ生成・発売日確認用
     gemini_parse_model: str = "gemini-2.5-flash"     # タイトル分解（軽量タスク）
@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # Supabase
     supabase_url: str
     supabase_service_key: str
+
+    # ラノベ書庫 (Next.js) のキャッシュを捨てる先。カンマ区切りで複数 (書影あり / なしの2つの版)。
+    # 空なら呼ばない (DB は更新されるが、アプリへの反映はキャッシュの期限 (最大1時間) 待ちになる)
+    revalidate_urls: str = ""
+    revalidate_secret: str = ""
 
     # アプリ設定
     target_x_account: str = "K_lanove_bunko"
